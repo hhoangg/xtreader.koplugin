@@ -15,7 +15,7 @@ position, books and wallpapers all ride routes that already existed:
 
 | What | How |
 |---|---|
-| reading position | KOReader's own **kosync**, pointed at this server — wire-compatible by design, so nothing here reimplements it |
+| reading position | KOReader's own **[kosync](https://github.com/koreader/koreader/tree/master/plugins/kosync.koplugin)**, pointed at this server — wire-compatible by design, so nothing here reimplements it |
 | books | `GET /library/manifest`, reconciled against what is on disk |
 | wallpapers | `GET /wallpapers/manifest`, into the screensaver folder |
 | reading statistics | `POST /stats/pages`, read out of KOReader's own `statistics.sqlite3` |
@@ -91,8 +91,9 @@ server's clock is the only authority on expiry, and the poll keeps running.
 
 ## Reading statistics, and the watermark
 
-`statistics.sqlite3` is KOReader's own database and belongs to the statistics
-plugin. This opens it **read-only** and never writes to it.
+`statistics.sqlite3` is KOReader's own database and belongs to the
+[statistics plugin](https://github.com/koreader/koreader/tree/master/plugins/statistics.koplugin), not
+to this one. This opens it **read-only** and never writes to it.
 
 Rows come from `page_stat_data`, the real table — never the `page_stat` **view**.
 That view rescales historical page numbers against the book's *current* page
@@ -130,8 +131,9 @@ that is the one fact you need to answer the question. 42% from a reader you put
 down an hour ago and 42% from one you last touched in March are the same
 sentence and very different decisions.
 
-The server already sends it — kosync reads `timestamp` to decide direction and
-then drops it before drawing the dialog.
+The server already sends it — [kosync](https://github.com/koreader/koreader/tree/master/plugins/kosync.koplugin)
+reads `timestamp` to decide direction and then drops it before drawing the
+dialog.
 
 The patch does **not** replace `KOSync:getProgress`, which would mean copying
 ~80 lines of upstream logic and owning them forever. It patches two narrow
@@ -174,7 +176,8 @@ this plugin's own files or to a module KOReader ships.
   AGPL-3.0. No code is copied; this is a plugin that calls its widgets, events
   and network manager at runtime, and reuses `QRWidget`, `Trapper` and
   `DocumentRegistry` rather than reimplementing them.
-- **kosync** (`kosync.koplugin`, in-tree in KOReader), AGPL-3.0. Reading
+- **kosync** ([`kosync.koplugin`](https://github.com/koreader/koreader/tree/master/plugins/kosync.koplugin), in-tree in
+  KOReader), AGPL-3.0. Reading
   position is *its* job, not this plugin's — pairing configures it and gets out
   of the way. The userpatch wraps two of its functions at runtime and copies
   none of them.
