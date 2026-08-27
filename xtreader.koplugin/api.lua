@@ -119,6 +119,24 @@ function Api:getJson(path, headers)
     return decodeJson(body), code
 end
 
+--- DELETE with no body.
+--
+-- 404 is folded into success on purpose: it means the row is already gone, and
+-- the caller's goal -- "this book should not be on the server" -- is met either
+-- way. Treating it as a failure would strand a book locally forever, because
+-- the delete would never be able to report done.
+function Api:delete(path)
+    local code, body = self:request({
+        url = self:baseUrl() .. path,
+        method = "DELETE",
+        headers = self:authHeaders({ ["Accept"] = "application/json" }),
+    })
+    if code == 200 or code == 204 or code == 404 then
+        return true, code
+    end
+    return false, code, decodeJson(body)
+end
+
 function Api:postJson(path, payload, opts)
     opts = opts or {}
     local data = payload and JSON.encode(payload) or ""
