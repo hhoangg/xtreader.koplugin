@@ -138,6 +138,24 @@ function Store:setCatalogue(entries)
     self.dirty = true
 end
 
+--- Correct one catalogue entry in place.
+--
+-- The catalogue is normally replaced wholesale by a full manifest, and that is
+-- deliberate -- a merge cannot express removal. But a sync that CHANGES the
+-- account partway through has already written its snapshot: the manifest is
+-- fetched first, the catalogue is written from it, and only then does pass 3
+-- discover a local move and push it. The snapshot is a version of the account
+-- that stopped being true during the same function.
+--
+-- Left alone, the placeholder provider reads the stale path, finds no file
+-- there, and draws a placeholder for a book the reader is looking at in its new
+-- folder -- which is exactly what happened on the device.
+function Store:setCatalogueEntry(id, entry)
+    if id == nil then return end
+    self.catalogue[id] = entry
+    self.dirty = true
+end
+
 function Store:getCatalogueEntry(id)
     return self.catalogue[id]
 end

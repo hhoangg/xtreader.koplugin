@@ -424,6 +424,19 @@ function Library.sync(api, store, report)
                     known.path = new_rel
                     known.move_conflict = nil
                     store:setBook(id, known)
+                    -- The CATALOGUE too, not just the ledger.
+                    --
+                    -- The catalogue was written from a manifest fetched at the
+                    -- top of this function, before the move existed, so it
+                    -- still points at the old path -- and it is what the
+                    -- placeholder provider reads. Without this the reader sees
+                    -- the book in its new folder AND a placeholder for it in
+                    -- the old one, which is what happened on the device.
+                    local cat = store:getCatalogueEntry(id)
+                    if cat then
+                        cat.path = new_rel
+                        store:setCatalogueEntry(id, cat)
+                    end
                     moved = moved + 1
                 elseif move_err == "gone" then
                     -- The account no longer has this book at all. That is a
