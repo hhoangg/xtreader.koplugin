@@ -181,5 +181,31 @@ test("a book over the server's ceiling is not sent", function()
     assert(stats.too_big == 1)
 end)
 
+-- ---------------------------------------------- folders the device owns
+
+test("Amazon's own folders are excluded without being configured", function()
+    -- /mnt/us/documents is the folder the Kindle firmware owns and KOReader was
+    -- merely pointed at. Downloads/ is where the firmware puts what it
+    -- downloads -- including the original files a converted library was made
+    -- FROM -- and dictionaries/ holds DRM'd purchases. Asking every Kindle
+    -- owner to work these out and type them in, on a device that already knows
+    -- which folder it is looking at, is a question with one answer.
+    local owned = Upload.deviceOwnedFolders("/mnt/us/documents")
+    assert(owned.Downloads and owned.dictionaries,
+        "expected the firmware's folders to be excluded by default")
+    assert(Upload.deviceOwnedFolders("/mnt/us/documents/") .Downloads,
+        "a trailing slash must not defeat it")
+end)
+
+test("only for THAT root, not for the whole device", function()
+    -- A reader who points KOReader at /mnt/us/books has a Downloads folder
+    -- that is theirs, on the same hardware. Keying this on "am I a Kindle"
+    -- rather than on the path would have this code overrule them.
+    assert(next(Upload.deviceOwnedFolders("/mnt/us/books")) == nil,
+        "a different root on the same device must be left alone")
+    assert(next(Upload.deviceOwnedFolders("/mnt/onboard/.adds/books")) == nil)
+    assert(next(Upload.deviceOwnedFolders(nil)) == nil)
+end)
+
 io.write(string.format("PASS %d  FAIL %d\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

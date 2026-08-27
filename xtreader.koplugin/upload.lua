@@ -94,8 +94,47 @@ local HASH_CHUNK = 64 * 1024
 -- Takes the raw comma-separated string rather than reading a settings store,
 -- so scan() stays a pure function of its arguments and the callers -- which
 -- already hold the store -- decide where the value comes from.
-local function skipSet(raw)
+-- Folders the DEVICE owns, which the reader never created and should not have
+-- to name.
+--
+-- On a Kindle, /mnt/us/documents is Amazon's folder that KOReader was pointed
+-- at, not a folder anybody made for KOReader. Two things in it belong to the
+-- firmware:
+--
+--   Downloads/     where the Kindle puts what it downloads, including the
+--                  original files that a converted library was made FROM.
+--   dictionaries/  Amazon's dictionaries, DRM'd and unopenable elsewhere.
+--
+-- Excluded by default because the alternative is asking every Kindle owner to
+-- work out where the firmware keeps its files and type it in -- to get the
+-- obvious answer, on a device where the plugin already knows which one it is
+-- running on. Both are still listable in the setting if somebody wants them.
+-- Keyed on the ROOT PATH, not on what hardware this is.
+--
+-- The question is not "am I a Kindle" but "is this library root Amazon's own
+-- documents folder". A reader who points KOReader at /mnt/us/books has a
+-- Downloads folder that is theirs, on the same device, and excluding it would
+-- be this code deciding it knows better.
+--
+-- It is also the only version of this that can be tested. `require("device")`
+-- does not load outside KOReader -- it reaches through FFI into the framebuffer
+-- -- so a Device-based check could not be verified anywhere but on the device,
+-- by hand, which is how the last unverifiable assumption in this file reached
+-- the owner as a frozen screen.
+local ROOT_OWNED = {
+    ["/mnt/us/documents"] = { Downloads = true, dictionaries = true },
+}
+
+local function deviceOwnedFolders(root)
+    if type(root) ~= "string" then return {} end
+    return ROOT_OWNED[(root:gsub("/+$", ""))] or {}
+end
+
+Upload.deviceOwnedFolders = deviceOwnedFolders
+
+local function skipSet(raw, root)
     local set = {}
+    for name in pairs(deviceOwnedFolders(root)) do set[name] = true end
     if type(raw) ~= "string" or raw == "" then return set end
     for name in raw:gmatch("[^,]+") do
         name = name:gsub("^%s+", ""):gsub("%s+$", "")
@@ -175,7 +214,7 @@ end
 function Upload.scan(root, skip_csv, formats_csv)
     local lfs = require("libs/libkoreader-lfs")
     root = tostring(root):gsub("/+$", "")
-    local skip = skipSet(skip_csv)
+    local skip = skipSet(skip_csv, root)
     -- nil means "every format this understands"; a set narrows it.
     local want = formatSet(formats_csv)
     local out = {}
