@@ -323,22 +323,28 @@ function Api:uploadFile(path, query, local_path, progress_cb)
     if query and query ~= "" then url = url .. "?" .. query end
 
     local sink = {}
-    -- NO TOTAL TIMEOUT, and a generous block timeout. This is not a loosened
-    -- limit, it is the right shape of limit for a transfer whose size is not
-    -- known in advance.
+    -- A total timeout DERIVED FROM THE FILE SIZE. Both fixed answers are wrong,
+    -- and both were tried on the device:
     --
-    -- KOReader's FILE_TOTAL_TIMEOUT is 60 SECONDS for the whole request. At the
-    -- ~2 MB/s a Kindle manages that kills any book over about 120 MB outright,
-    -- and on Wi-Fi that dips it kills far smaller ones -- observed on the
-    -- device as `wantwrite` and `Connection reset by peer` on two large books,
-    -- both of which are what a healthy transfer looks like when something cuts
-    -- it off mid-stream.
+    --   KOReader's FILE_TOTAL_TIMEOUT is a flat 60 seconds for the whole
+    --   request. At the ~2 MB/s a Kindle manages that kills any book over about
+    --   120 MB outright, and on Wi-Fi that dips it kills much smaller ones --
+    --   seen as `wantwrite` and `Connection reset by peer` on two large books,
+    --   which is what a healthy transfer looks like when something cuts it off.
     --
-    -- A TOTAL timeout asks "has this taken too long", which for an upload is a
-    -- question about the file's size, not about whether anything is wrong. A
-    -- BLOCK timeout asks "has nothing moved for 30 seconds", which is the
-    -- actual failure worth giving up on. So: block yes, total no.
-    socketutil:set_timeout(30, -1)
+    --   No total timeout at all then hangs forever on a connection that stalls
+    --   rather than dies. Seen minutes later on a 1 MB book, with
+    --   `netstat` showing 26 KB sitting in the send queue and going nowhere:
+    --   the block timeout never fires, because a trickle is not silence.
+    --
+    -- So the ceiling scales with what is being sent: a floor of 60 seconds for
+    -- the handshake and the server's own work, plus the time the file would
+    -- take at a deliberately pessimistic 50 KB/s. That is roughly a fortieth of
+    -- what the device actually manages, so a healthy transfer never comes near
+    -- it, while a stalled one still ends.
+    local floor_sec, slow_bytes_per_sec = 60, 50 * 1024
+    local total_timeout = floor_sec + math.ceil(attr.size / slow_bytes_per_sec)
+    socketutil:set_timeout(30, total_timeout)
     local code, _, status = socket.skip(1, http.request({
         url     = url,
         method  = "POST",
