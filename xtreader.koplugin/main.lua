@@ -349,8 +349,10 @@ function Xtreader:addToMainMenu(menu_items)
                     --
                     -- Only when the list is EMPTY: somebody who has set one has
                     -- thought about this and does not need asking again.
+                    -- Either filter counts as "has thought about this".
                     local skip = self.store:get("upload_skip")
-                    if skip and skip ~= "" then return go() end
+                    local fmts = self.store:get("upload_formats")
+                    if (skip and skip ~= "") or (fmts and fmts ~= "") then return go() end
 
                     local root = self.store:get("library_dir")
                     local books = root and Upload.scan(root) or {}
@@ -431,6 +433,34 @@ function Xtreader:addToMainMenu(menu_items)
             {
                 text = _("Books folder"),
                 callback = function() self:editSetting("library_dir", _("Books folder")) end,
+            },
+            {
+                text = _("Formats to upload"),
+                help_text = _("Comma-separated file extensions that \"Upload this device's books\" should send, for example: epub\n\nThis is usually what you want rather than excluding folders. A library converted from a Kindle holds the original files next to the converted copies, and naming the format you keep is the same answer as listing every folder the originals ended up in -- except it keeps working when a stray one turns up somewhere you did not think of.\n\nLeave empty to upload every format."),
+                callback = function()
+                    local dialog
+                    dialog = InputDialog:new({
+                        title = _("Formats to upload"),
+                        input = tostring(self.store:get("upload_formats") or ""),
+                        input_hint = _("epub"),
+                        buttons = { {
+                            { text = _("Cancel"), id = "close",
+                              callback = function() UIManager:close(dialog) end },
+                            {
+                                text = _("Save"),
+                                is_enter_default = true,
+                                callback = function()
+                                    local value = dialog:getInputText() or ""
+                                    self.store:set("upload_formats", (value:gsub("^%s+", ""):gsub("%s+$", "")))
+                                    self.store:flush()
+                                    UIManager:close(dialog)
+                                end,
+                            },
+                        } },
+                    })
+                    UIManager:show(dialog)
+                    dialog:onShowKeyboard()
+                end,
             },
             {
                 text = _("Folders to leave out of uploads"),

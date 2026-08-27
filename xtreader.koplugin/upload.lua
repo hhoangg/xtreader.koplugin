@@ -106,6 +106,28 @@ end
 
 Upload.skipSet = skipSet
 
+--- Extensions the reader wants uploaded, or nil for "whatever is a book".
+--
+-- This is the filter that matches what people actually mean, and the folder
+-- list above is the one that does not.
+--
+-- A library converted from a Kindle holds the ORIGINALS and the converted
+-- copies side by side. Asking "which folders do I not want" makes the reader
+-- work out where the originals ended up; asking "which formats do I want"
+-- is the same answer stated directly -- and it keeps working when a stray
+-- .azw3 turns up in a folder nobody thought to exclude.
+local function formatSet(raw)
+    if type(raw) ~= "string" or raw:gsub("%s", "") == "" then return nil end
+    local set = {}
+    for e in raw:gmatch("[^,]+") do
+        e = e:gsub("^%s+", ""):gsub("%s+$", ""):gsub("^%.", ""):lower()
+        if e ~= "" then set[e] = true end
+    end
+    return next(set) and set or nil
+end
+
+Upload.formatSet = formatSet
+
 local function extOf(name)
     local e = name:match("%.([^.]+)$")
     return e and e:lower() or nil
@@ -150,10 +172,12 @@ end
 -- device's library root IS the account root, so a book at
 -- `<root>/Tiên hiệp/X.epub` is `/Tiên hiệp/X.epub` on the account. That is
 -- `localPathFor` run backwards, and nothing arbitrates it.
-function Upload.scan(root, skip_csv)
+function Upload.scan(root, skip_csv, formats_csv)
     local lfs = require("libs/libkoreader-lfs")
     root = tostring(root):gsub("/+$", "")
     local skip = skipSet(skip_csv)
+    -- nil means "every format this understands"; a set narrows it.
+    local want = formatSet(formats_csv)
     local out = {}
     local function walk(dir, depth)
         -- 12 is far past any sane library nesting and stops a symlink loop from
@@ -173,7 +197,9 @@ function Upload.scan(root, skip_csv)
                     if not excluded and not name:match("%.sdr$") then
                         walk(full, depth + 1)
                     end
-                elseif attr and attr.mode == "file" and BOOK_EXT[extOf(name) or ""] then
+                elseif attr and attr.mode == "file"
+                        and BOOK_EXT[extOf(name) or ""]
+                        and (want == nil or want[extOf(name) or ""]) then
                     out[#out + 1] = {
                         path = full,
                         rel  = full:sub(#root + 1),   -- keeps the leading "/"
@@ -222,7 +248,7 @@ function Upload.pushAll(api, store, report)
         return false, _("No library folder is configured.")
     end
 
-    local books = Upload.scan(root, store:get("upload_skip"))
+    local books = Upload.scan(root, store:get("upload_skip"), store:get("upload_formats"))
     if #books == 0 then
         return true, _("No books found to upload."), { total = 0 }
     end
@@ -385,7 +411,7 @@ function Upload.dryRun(api, store, report)
     local root = store:get("library_dir")
     if not root then return false, _("No library folder is configured.") end
 
-    local books = Upload.scan(root, store:get("upload_skip"))
+    local books = Upload.scan(root, store:get("upload_skip"), store:get("upload_formats"))
     if report(T(_("Found %1 books. Reading the account…"), #books)) == false then
         return true, _("Stopped.")
     end
