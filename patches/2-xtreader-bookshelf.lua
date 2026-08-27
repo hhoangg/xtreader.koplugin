@@ -105,6 +105,48 @@ local function provider(dir)
     return out
 end
 
+--- Subfolder names directly under `dir` that hold catalogue books at ANY depth.
+--
+-- Without this the shelf never shows the folder, so its placeholders cannot be
+-- reached: getAll drops a directory with no book file under it, and a folder
+-- whose books are all still on the server has none. On a freshly paired device
+-- that is every folder the account has.
+--
+-- "At any depth" is the load-bearing part. A folder three levels above a book
+-- still has to be listed, or the reader cannot walk down to it -- so this
+-- matches on the path PREFIX and takes the next segment, rather than asking
+-- whether a book sits directly inside.
+local function folderProvider(dir)
+    local inst = plugin()
+    if not (inst and inst.store and inst.store.eachCatalogueEntry) then return {} end
+    if not inst.store:isPaired() then return {} end
+
+    local root = libraryRoot(inst)
+    if not root then return {} end
+    dir = tostring(dir):gsub("/+$", "")
+    -- Only paths inside the library are ours to answer for.
+    if dir ~= root and dir:sub(1, #root + 1) ~= root .. "/" then return {} end
+
+    local prefix = (dir == root) and "" or dir:sub(#root + 2)
+    if prefix ~= "" then prefix = prefix .. "/" end
+
+    local seen, out = {}, {}
+    for _id, entry in inst.store:eachCatalogueEntry() do
+        if entry.path and not entry.unavailable then
+            local rel = entry.path:gsub("^/+", "")
+            if prefix == "" or rel:sub(1, #prefix) == prefix then
+                local rest = rel:sub(#prefix + 1)
+                local seg = rest:match("^([^/]+)/")  -- nil when the book is directly here
+                if seg and not seen[seg] then
+                    seen[seg] = true
+                    out[#out + 1] = seg
+                end
+            end
+        end
+    end
+    return out
+end
+
 --- Fetch one tapped book, then hand back where it landed.
 --
 -- `done(path)` on success, `done(nil, message)` on failure. Called exactly
@@ -167,5 +209,10 @@ userpatch.registerPatchPluginFunc("kindleui", function()
     end
     Placeholders.setProvider(provider)
     Placeholders.setOpener(opener)
+    -- Optional on older kindleui builds: registered only when present, so this
+    -- patch keeps working against a version that has books but not folders.
+    if type(Placeholders.setFolderProvider) == "function" then
+        Placeholders.setFolderProvider(folderProvider)
+    end
     logger.dbg("xtreader: shelf placeholders registered with kindleui")
 end)
