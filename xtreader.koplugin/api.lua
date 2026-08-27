@@ -323,7 +323,22 @@ function Api:uploadFile(path, query, local_path, progress_cb)
     if query and query ~= "" then url = url .. "?" .. query end
 
     local sink = {}
-    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+    -- NO TOTAL TIMEOUT, and a generous block timeout. This is not a loosened
+    -- limit, it is the right shape of limit for a transfer whose size is not
+    -- known in advance.
+    --
+    -- KOReader's FILE_TOTAL_TIMEOUT is 60 SECONDS for the whole request. At the
+    -- ~2 MB/s a Kindle manages that kills any book over about 120 MB outright,
+    -- and on Wi-Fi that dips it kills far smaller ones -- observed on the
+    -- device as `wantwrite` and `Connection reset by peer` on two large books,
+    -- both of which are what a healthy transfer looks like when something cuts
+    -- it off mid-stream.
+    --
+    -- A TOTAL timeout asks "has this taken too long", which for an upload is a
+    -- question about the file's size, not about whether anything is wrong. A
+    -- BLOCK timeout asks "has nothing moved for 30 seconds", which is the
+    -- actual failure worth giving up on. So: block yes, total no.
+    socketutil:set_timeout(30, -1)
     local code, _, status = socket.skip(1, http.request({
         url     = url,
         method  = "POST",

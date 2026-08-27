@@ -84,7 +84,7 @@ local function writeState(t)
     local f = io.open(tmp, "w")
     if not f then return false end
     for _i, k in ipairs({ "phase", "total", "done", "sent", "skipped", "conflict",
-                          "failed", "too_big", "bytes_done", "bytes_total",
+                          "failed", "too_big", "bytes_done", "bytes_sent", "bytes_total",
                           "started_at", "current", "message" }) do
         local v = t[k]
         if v ~= nil then
@@ -125,23 +125,41 @@ end
 Job.writeState = writeState
 Job.readState  = readState
 
---- Bytes per second so far, or nil before there is anything to divide.
+--- Bytes per second actually transferred, or nil when there is nothing honest
+--- to divide.
+--
+-- `bytes_sent`, NOT `bytes_done`. A run that resumes an interrupted one begins
+-- by skipping every book the account already has: those advance bytes_done at
+-- disk speed and send nothing, so dividing them by elapsed time reports a
+-- throughput the connection never had -- and then an estimate built on it.
 --
 -- Averaged over the whole job rather than sampled: a per-book rate on a device
--- whose Wi-Fi power-saves swings wildly, and a figure that jumps between
--- 0.3 and 4 MB/s tells the reader less than one that settles.
+-- whose Wi-Fi power-saves swings wildly, and a figure jumping between 0.3 and
+-- 4 MB/s tells the reader less than one that settles.
 function Job.rate(st)
-    if not st or not st.started_at or not st.bytes_done then return nil end
+    if not st or not st.started_at then return nil end
+    local sent = st.bytes_sent or 0
     local elapsed = os.time() - st.started_at
-    if elapsed < 2 or st.bytes_done <= 0 then return nil end
-    return st.bytes_done / elapsed
+    if elapsed < 2 or sent <= 0 then return nil end
+    return sent / elapsed
 end
 
---- Seconds left at the current rate, or nil when that cannot be said honestly.
+--- Seconds left, or nil when that cannot be said honestly.
+--
+-- Deliberately absent until something has actually been sent. During an
+-- all-skips opening there is no rate, and an estimate derived from one anyway
+-- read "1020 min left" on a job that finished in minutes -- worse than no
+-- estimate, because a wrong number is one the reader will act on.
+--
+-- The remainder is an OVERESTIMATE by construction: some of what is left will
+-- turn out to be skippable and cost nothing. Erring long is the right way round
+-- -- a job that beats its estimate is a pleasant surprise.
 function Job.eta(st)
     local rate = Job.rate(st)
-    if not rate or not st.bytes_total or st.bytes_total <= st.bytes_done then return nil end
-    return (st.bytes_total - st.bytes_done) / rate
+    if not rate then return nil end
+    local total, done = st.bytes_total or 0, st.bytes_done or 0
+    if total <= done then return nil end
+    return (total - done) / rate
 end
 
 --- A snapshot for the control centre, or nil when there is nothing to show.

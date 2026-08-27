@@ -75,24 +75,51 @@ test("counters are written before books, so truncation loses the less important 
         .. "not the numbers the card is drawn from")
 end)
 
-test("rate is nil until there is something honest to divide", function()
+test("rate is nil until something has honestly been sent", function()
     assert(Job.rate(nil) == nil)
-    assert(Job.rate{ started_at = os.time(), bytes_done = 0 } == nil,
+    assert(Job.rate{ started_at = os.time(), bytes_sent = 0 } == nil,
         "zero bytes is not a rate")
-    assert(Job.rate{ started_at = os.time(), bytes_done = 500 } == nil,
+    assert(Job.rate{ started_at = os.time(), bytes_sent = 500 } == nil,
         "under two seconds is noise, not a measurement")
-    local r = Job.rate{ started_at = os.time() - 10, bytes_done = 10 * 1048576 }
+    local r = Job.rate{ started_at = os.time() - 10, bytes_sent = 10 * 1048576 }
     assert(r and math.abs(r - 1048576) < 1024, "expected ~1 MB/s, got " .. tostring(r))
 end)
 
+test("skipped books do not count towards the rate", function()
+    -- Seen on the device: a run resuming an interrupted one opened by skipping
+    -- eight books the account already had. Those advance bytes_done at disk
+    -- speed and send nothing, so a rate taken from bytes_done claimed a
+    -- throughput the connection never had -- and the card read
+    -- "8 of 89 - 0.0 MB/s - 1020 min left - 0%", every figure wrong in a
+    -- different direction.
+    local st = { started_at = os.time() - 30,
+                 bytes_done = 148 * 1048576,   -- all of it skipped
+                 bytes_sent = 0,
+                 bytes_total = 927 * 1048576 }
+    assert(Job.rate(st) == nil, "nothing was sent, so there is no rate")
+    assert(Job.eta(st) == nil, "and no rate means no estimate, not a huge one")
+end)
+
 test("eta refuses to guess when it cannot", function()
-    assert(Job.eta{ started_at = os.time() - 10, bytes_done = 1048576 } == nil,
+    assert(Job.eta{ started_at = os.time() - 10, bytes_sent = 1048576 } == nil,
         "no total means no estimate")
-    assert(Job.eta{ started_at = os.time() - 10, bytes_done = 10, bytes_total = 10 } == nil,
+    assert(Job.eta{ started_at = os.time() - 10, bytes_sent = 10,
+                    bytes_done = 10, bytes_total = 10 } == nil,
         "nothing left is not 'a moment', it is over")
-    local e = Job.eta{ started_at = os.time() - 10, bytes_done = 10 * 1048576,
-                       bytes_total = 20 * 1048576 }
+    -- Remaining is measured from bytes_DONE (what is left to get through),
+    -- divided by a rate measured from bytes_SENT (how fast the wire is).
+    local e = Job.eta{ started_at = os.time() - 10, bytes_sent = 10 * 1048576,
+                       bytes_done = 10 * 1048576, bytes_total = 20 * 1048576 }
     assert(e and math.abs(e - 10) < 2, "expected ~10s left, got " .. tostring(e))
+end)
+
+test("state carries both byte counters", function()
+    Job.writeState{ phase = "running", total = 89, done = 8,
+                    bytes_done = 100, bytes_sent = 0, bytes_total = 900 }
+    local st = Job.readState()
+    assert(st.bytes_done == 100 and st.bytes_sent == 0 and st.bytes_total == 900,
+        "both counters must survive the round trip or the card cannot tell "
+        .. "progress from throughput")
 end)
 
 test("dismiss refuses while a job is running", function()

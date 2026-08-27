@@ -319,10 +319,20 @@ function Upload.pushAll(api, store, report, opts)
         total = #books, sent = 0, skipped = 0, conflict = 0,
         too_big = 0, failed = 0, forbidden = false,
     }
-    -- Accumulated for the progress card. Bytes rather than book count, because
-    -- a library where one book is 60 MB and the next is 300 KB makes "12 of 87"
-    -- a poor guide to how long is left.
-    local bytes_done, bytes_total = 0, 0
+    -- TWO byte counters, because they answer two different questions and
+    -- conflating them produced a card reading "8 of 89 - 0.0 MB/s - 0%".
+    --
+    --   bytes_done  everything ACCOUNTED FOR: uploaded, skipped, refused,
+    --               too large. This is the progress bar, and a book the
+    --               account already has is as finished as one just sent.
+    --   bytes_sent  what actually went over the wire. This is the rate, and
+    --               only this: counting a skipped book as transferred would
+    --               claim a throughput the connection never had.
+    --
+    -- The first run after an interrupted one is all skips, so the two diverge
+    -- immediately and visibly -- which is exactly when the old single counter
+    -- said the job was doing nothing.
+    local bytes_done, bytes_sent, bytes_total = 0, 0, 0
     for _i, b in ipairs(books) do bytes_total = bytes_total + (b.size or 0) end
     local started_at = os.time()
     local accepted = {}
@@ -334,7 +344,8 @@ function Upload.pushAll(api, store, report, opts)
                    + stats.conflict + stats.failed + stats.too_big,
             sent = stats.sent, skipped = stats.skipped, conflict = stats.conflict,
             failed = stats.failed, too_big = stats.too_big,
-            bytes_done = bytes_done, bytes_total = bytes_total,
+            bytes_done = bytes_done, bytes_sent = bytes_sent,
+            bytes_total = bytes_total,
             started_at = started_at, current = current or "",
             books = accepted,
         })
@@ -360,21 +371,25 @@ function Upload.pushAll(api, store, report, opts)
 
         if b.size > MAX_BYTES then
             stats.too_big = stats.too_big + 1
+            bytes_done = bytes_done + (b.size or 0)
             logger.warn("xtreader: too large to upload:", b.rel, b.size)
         else
             local hash, hash_err = Upload.contentHash(b.path)
             if not hash then
                 stats.failed = stats.failed + 1
+                bytes_done = bytes_done + (b.size or 0)
                 logger.warn("xtreader: cannot hash:", b.rel, tostring(hash_err))
             else
                 local known = have[b.rel]
                 if known == hash then
                     -- Same path, same bytes: the account has this exact book.
                     stats.skipped = stats.skipped + 1
+                    bytes_done = bytes_done + (b.size or 0)
                 elseif known ~= nil then
                     -- Same path, DIFFERENT bytes. Not adopted, and the owner is
                     -- the one who decides what should happen -- see the header.
                     stats.conflict = stats.conflict + 1
+                    bytes_done = bytes_done + (b.size or 0)
                     conflicts[#conflicts + 1] = b.rel
                     logger.warn("xtreader: path held by a different book, not uploaded:", b.rel)
                 else
@@ -408,6 +423,7 @@ function Upload.pushAll(api, store, report, opts)
                     if entry then
                         stats.sent = stats.sent + 1
                         bytes_done = bytes_done + (b.size or 0)
+                        bytes_sent = bytes_sent + (b.size or 0)
                         if entry.id then
                             accepted[#accepted + 1] = {
                                 id = entry.id, path = entry.path or b.rel,
@@ -433,8 +449,10 @@ function Upload.pushAll(api, store, report, opts)
                         -- Raced with another writer between the manifest and
                         -- now. Same meaning as the known-hash case.
                         stats.skipped = stats.skipped + 1
+                        bytes_done = bytes_done + (b.size or 0)
                     else
                         stats.failed = stats.failed + 1
+                        bytes_done = bytes_done + (b.size or 0)
                         logger.warn("xtreader: upload failed:", b.rel, tostring(up_code))
                     end
                 end
@@ -448,7 +466,8 @@ function Upload.pushAll(api, store, report, opts)
             done = stats.sent + stats.skipped + stats.conflict + stats.failed + stats.too_big,
             sent = stats.sent, skipped = stats.skipped, conflict = stats.conflict,
             failed = stats.failed, too_big = stats.too_big,
-            bytes_done = bytes_done, bytes_total = bytes_total,
+            bytes_done = bytes_done, bytes_sent = bytes_sent,
+            bytes_total = bytes_total,
             started_at = started_at, current = "", books = accepted,
         })
     end
