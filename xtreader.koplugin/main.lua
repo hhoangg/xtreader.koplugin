@@ -311,6 +311,9 @@ function Xtreader:addToMainMenu(menu_items)
         sub_item_table = {
             {
                 text = _("Sync now"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_sync_now",
                 enabled_func = function() return self.store:isPaired() end,
                 callback = function()
                     self:runSync(function(report) return self:syncAll(report) end)
@@ -318,6 +321,9 @@ function Xtreader:addToMainMenu(menu_items)
             },
             {
                 text = _("Sync books only"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_sync_books",
                 enabled_func = function() return self.store:isPaired() end,
                 callback = function()
                     self:runSync(function(report)
@@ -327,6 +333,9 @@ function Xtreader:addToMainMenu(menu_items)
             },
             {
                 text = _("Upload this device's books"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_upload",
                 enabled_func = function() return self.store:isPaired() end,
                 help_text = _("Sends every book in your books folder that the account does not already have, so books that exist only on this device become account books and survive it.\n\nOnly one reader per account may upload, chosen in the device list on the web. Until one is chosen this is refused, and it is refused before anything is sent.\n\nBooks already on the account are skipped without being sent again."),
                 callback = function()
@@ -383,6 +392,9 @@ function Xtreader:addToMainMenu(menu_items)
             },
             {
                 text = _("Check what would be uploaded"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_upload_check",
                 enabled_func = function() return self.store:isPaired() end,
                 help_text = _("Counts and measures without sending anything: how many books the account does not have, how many it already has, and how many sit at a path the account gives to a different book.\n\nRun this first. It cannot tell you whether this reader is allowed to upload -- the server only answers that when something is actually sent."),
                 callback = function()
@@ -394,6 +406,9 @@ function Xtreader:addToMainMenu(menu_items)
             },
             {
                 text = _("Send reading statistics"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_stats",
                 enabled_func = function() return self.store:isPaired() end,
                 help_text = _("Uploads KOReader's own per-page reading records so the web dashboard can show streaks, heatmaps and reading time across every reader on the account. Reads the statistics database, never writes to it."),
                 callback = function()
@@ -404,6 +419,9 @@ function Xtreader:addToMainMenu(menu_items)
             },
             {
                 text = _("Sync wallpapers only"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_wallpapers",
                 enabled_func = function() return self.store:isPaired() end,
                 separator = true,
                 callback = function()
@@ -414,16 +432,25 @@ function Xtreader:addToMainMenu(menu_items)
             },
             {
                 text = _("Pair this device"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_pair",
                 enabled_func = function() return not self.store:isPaired() end,
                 callback = function() self:pair() end,
             },
             {
                 text = _("Unpair"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_unpair",
                 enabled_func = function() return self.store:isPaired() end,
                 callback = function() self:unpair() end,
             },
             {
                 text = _("Reapply progress sync settings"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_kosync",
                 enabled_func = function() return self.store:isPaired() end,
                 separator = true,
                 help_text = _("Points KOReader's progress sync at this server and sets binary (content) matching, which is what the CrossPoint reader uses and what stock KOReader defaults to. A mismatch here makes sync appear to do nothing at all."),
@@ -440,14 +467,23 @@ function Xtreader:addToMainMenu(menu_items)
             },
             {
                 text = _("Server address"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_server",
                 callback = function() self:editSetting("base_url", _("Server address")) end,
             },
             {
                 text = _("Books folder"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_books_dir",
                 callback = function() self:editSetting("library_dir", _("Books folder")) end,
             },
             {
                 text = _("Formats to upload"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_formats",
                 help_text = _("Comma-separated file extensions that \"Upload this device's books\" should send, for example: epub\n\nThis is usually what you want rather than excluding folders. A library converted from a Kindle holds the original files next to the converted copies, and naming the format you keep is the same answer as listing every folder the originals ended up in -- except it keeps working when a stray one turns up somewhere you did not think of.\n\nLeave empty to upload every format."),
                 callback = function()
                     local dialog
@@ -476,6 +512,9 @@ function Xtreader:addToMainMenu(menu_items)
             },
             {
                 text = _("Folders to leave out of uploads"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_skip",
                 help_text = _("Comma-separated names of top-level folders inside your books folder that \"Upload this device's books\" should skip.\n\nWorth setting before the first upload: a folder of original Kindle files that were converted to EPUB and filed elsewhere would otherwise put every one of those books on the account twice, and DRM-protected purchases would upload bytes that cannot be opened anywhere else.\n\nOnly matches at the top level. Leave empty to upload everything."),
                 callback = function()
                     local dialog
@@ -508,6 +547,9 @@ function Xtreader:addToMainMenu(menu_items)
             },
             {
                 text = _("Wallpapers folder"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_wall_dir",
                 separator = true,
                 callback = function()
                     self:editSetting("wallpaper_dir", _("Wallpapers folder"))
@@ -516,6 +558,9 @@ function Xtreader:addToMainMenu(menu_items)
             },
             {
                 text = _("Download every book automatically"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_auto_dl",
                 checked_func = function()
                     return G_reader_settings:isTrue("xtreader_auto_download")
                 end,
@@ -526,6 +571,9 @@ function Xtreader:addToMainMenu(menu_items)
             },
             {
                 text = _("Sync in the background"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_background",
                 checked_func = function() return self:autoSyncEnabled() end,
                 help_text = _("When the device wakes and Wi-Fi is already up, send reading statistics without showing anything. Nothing is drawn on success or on failure, and the radio is never switched on for it -- if Wi-Fi is off, the rows simply wait for a wake when it is on.\n\nBooks and wallpapers are not included; those stay manual."),
                 separator = true,
@@ -535,6 +583,9 @@ function Xtreader:addToMainMenu(menu_items)
             },
             {
                 text = _("Status"),
+                -- `id` so kindleui's settings page can give this row an
+                -- icon; it keys on ids, never on titles.
+                id = "xtreader_status",
                 keep_menu_open = true,
                 callback = function() notify(self:statusText(), 10) end,
             },
