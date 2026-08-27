@@ -331,9 +331,40 @@ function Xtreader:addToMainMenu(menu_items)
                 help_text = _("Sends every book in your books folder that the account does not already have, so books that exist only on this device become account books and survive it.\n\nOnly one reader per account may upload, chosen in the device list on the web. Until one is chosen this is refused, and it is refused before anything is sent.\n\nBooks already on the account are skipped without being sent again."),
                 callback = function()
                     local Upload = require("upload")
-                    self:runSync(function(report)
-                        return Upload.pushAll(self.api, self.store, report)
-                    end, { beat = true })
+                    local function go()
+                        self:runSync(function(report)
+                            return Upload.pushAll(self.api, self.store, report)
+                        end, { beat = true })
+                    end
+                    -- Ask once when nothing is excluded.
+                    --
+                    -- Not paternalism: a books folder that came from a Kindle
+                    -- normally contains the ORIGINALS beside the converted
+                    -- copies, so an unfiltered first push sends every one of
+                    -- those books twice, under two paths, and the account has
+                    -- no way to know. That happened on the device this was
+                    -- written on -- the upload was already running before it
+                    -- was noticed, and the only way to stop it was a signal
+                    -- over SSH.
+                    --
+                    -- Only when the list is EMPTY: somebody who has set one has
+                    -- thought about this and does not need asking again.
+                    local skip = self.store:get("upload_skip")
+                    if skip and skip ~= "" then return go() end
+
+                    local root = self.store:get("library_dir")
+                    local books = root and Upload.scan(root) or {}
+                    local mb = 0
+                    for _i, b in ipairs(books) do mb = mb + (b.size or 0) end
+                    mb = math.floor(mb / 1048576)
+
+                    UIManager:show(ConfirmBox:new{
+                        text = T(_("Upload all %1 books (%2 MB)?\n\nNothing is excluded. If this folder holds the original files a converted copy was made from, both go up as separate books.\n\nSet \"Folders to leave out of uploads\" first if that applies."),
+                                 #books, mb),
+                        ok_text = _("Upload all"),
+                        ok_callback = go,
+                        cancel_text = _("Not yet"),
+                    })
                 end,
             },
             {

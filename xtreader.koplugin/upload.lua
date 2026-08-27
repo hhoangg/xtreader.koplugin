@@ -227,7 +227,14 @@ function Upload.pushAll(api, store, report)
         return true, _("No books found to upload."), { total = 0 }
     end
 
-    report(T(_("Checking what the account already has… (%1 books here)"), #books))
+    -- The return value matters here too. Fetching the manifest is a network
+    -- round trip on a device whose Wi-Fi may still be waking up, so it is a
+    -- plausible moment to change your mind -- and an abort that lands on a
+    -- report nobody checks is an abort that silently does nothing, which is
+    -- how a reader learns not to trust the stop button.
+    if report(T(_("Checking what the account already has… (%1 books here)"), #books)) == false then
+        return true, _("Stopped before anything was sent.")
+    end
     local have, code = accountByPath(api)
     if not have then
         return false, T(_("Could not read the library manifest (%1)."), tostring(code))
@@ -242,7 +249,14 @@ function Upload.pushAll(api, store, report)
     -- owner can act on, and acting on it is the only reason to report it.
     local conflicts = {}
 
+    -- Set when the reader aborts DURING a book rather than between two. The
+    -- upload itself is not cut short -- an abandoned body is a partial object
+    -- the server has to clean up -- so the flag is checked at the top of the
+    -- next iteration instead.
+    local aborted = false
+
     for i, b in ipairs(books) do
+        if aborted then break end
         if report(T(_("Uploading %1 of %2:\n%3"), i, #books, b.rel)) == false then
             break
         end
@@ -269,7 +283,35 @@ function Upload.pushAll(api, store, report)
                 else
                     local query = "path=" .. Upload.escape(b.rel)
                                   .. "&contentHash=" .. Upload.escape(hash)
-                    local entry, up_code = api:uploadFile("/library/upload", query, b.path)
+                    -- THE STOP BUTTON LIVES HERE, and it is not decoration.
+                    --
+                    -- Trapper only repaints -- and only notices a tap -- when
+                    -- the coroutine yields, and `report` is what yields. Called
+                    -- once per book, as it was, a 10 MB upload is minutes in a
+                    -- blocking socket loop with no yield in it: the pause
+                    -- dialog cannot be drawn at the one moment somebody wants
+                    -- it, so the reader taps a frozen screen and concludes the
+                    -- device has hung. Reported on the device, and the only way
+                    -- out was a signal over SSH.
+                    --
+                    -- Reporting from inside the upload's own byte pump gives
+                    -- the coroutine a yield point every chunk. Throttled to
+                    -- whole percent steps because `report` repaints e-ink and
+                    -- doing that per 8 KB chunk would cost more than the
+                    -- transfer.
+                    local last_pct = -1
+                    local sent_cb = function(sofar)
+                        local pct = math.floor((sofar / math.max(1, b.size)) * 100)
+                        if pct > last_pct then
+                            last_pct = pct
+                            if report(T(_("Uploading %1 of %2 — %3%%\n%4"),
+                                        i, #books, pct, b.rel)) == false then
+                                aborted = true
+                            end
+                        end
+                    end
+                    local entry, up_code = api:uploadFile("/library/upload", query,
+                                                          b.path, sent_cb)
                     if entry then
                         stats.sent = stats.sent + 1
                         -- Record it the way a sync would, so the next inventory
@@ -300,6 +342,13 @@ function Upload.pushAll(api, store, report)
         end
     end
     store:flush()
+
+    if aborted then
+        local done = { T(_("Stopped. %1 uploaded so far"), stats.sent) }
+        if stats.skipped > 0 then done[#done + 1] = T(_("%1 already there"), stats.skipped) end
+        return true, table.concat(done, ", ") .. ".\n\n"
+               .. _("Running it again carries on from here: books already on the account are skipped without being read."), stats
+    end
 
     if stats.forbidden then
         return false, _("This reader is not the account's upload source.\n\nChoose it in the device list on the web, then try again."), stats
@@ -337,7 +386,9 @@ function Upload.dryRun(api, store, report)
     if not root then return false, _("No library folder is configured.") end
 
     local books = Upload.scan(root, store:get("upload_skip"))
-    report(T(_("Found %1 books. Reading the account…"), #books))
+    if report(T(_("Found %1 books. Reading the account…"), #books)) == false then
+        return true, _("Stopped.")
+    end
     local have, code = accountByPath(api)
     if not have then
         return false, T(_("Could not read the library manifest (%1)."), tostring(code))
