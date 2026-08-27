@@ -153,5 +153,60 @@ test(".sdr folders are not searched", function()
     assert(Library.findMovedTo(ROOT, "/A/x.epub", "CONTENTS-A") == nil)
 end)
 
+-- ------------------------------------------------- noting a move as it happens
+
+local function fakeStore(books, catalogue, root)
+    return {
+        _books = books, _cat = catalogue, flushed = false,
+        get = function(_s, k) return k == "library_dir" and (root or "/lib") or nil end,
+        eachBook = function(s) return pairs(s._books) end,
+        setBook = function(s, id, e) s._books[id] = e end,
+        getCatalogueEntry = function(s, id) return s._cat[id] end,
+        setCatalogueEntry = function(s, id, e) s._cat[id] = e end,
+        flush = function(s) s.flushed = true end,
+    }
+end
+
+test("a noted move corrects the CATALOGUE, which is what draws placeholders", function()
+    local st = fakeStore({ b1 = { path = "/test/x.epub" } },
+                         { b1 = { path = "/test/x.epub", hash = "h" } })
+    local id = Library.noteLocalMove(st, "/lib/test/x.epub", "/lib/Tien hiep/x.epub")
+    assert(id == "b1", "expected the book id, got " .. tostring(id))
+    assert(st._cat.b1.path == "/Tien hiep/x.epub",
+        "the catalogue must follow immediately or the old folder keeps a phantom")
+    assert(st.flushed, "an unflushed note is lost on the next restart")
+end)
+
+test("it does NOT move library.path, which would undo the move next sync", function()
+    -- library.path holds what the SERVER thinks. Pass 1 renames the local file
+    -- whenever the two disagree, so writing the new path here would have the
+    -- next sync drag the book back to where it came from.
+    local st = fakeStore({ b1 = { path = "/test/x.epub" } },
+                         { b1 = { path = "/test/x.epub" } })
+    Library.noteLocalMove(st, "/lib/test/x.epub", "/lib/Tien hiep/x.epub")
+    assert(st._books.b1.path == "/test/x.epub",
+        "library.path must still be the server's view, got " .. st._books.b1.path)
+    assert(st._books.b1.pending_move == "/Tien hiep/x.epub",
+        "the push has to be remembered somewhere, got " .. tostring(st._books.b1.pending_move))
+end)
+
+test("a file the account does not know about is ignored", function()
+    local st = fakeStore({ b1 = { path = "/test/x.epub" } }, { b1 = {} })
+    assert(Library.noteLocalMove(st, "/lib/other/z.epub", "/lib/Tien hiep/z.epub") == nil)
+    assert(st._books.b1.pending_move == nil, "an unrelated book must not be touched")
+end)
+
+test("a move to or from outside the library root is ignored", function()
+    local st = fakeStore({ b1 = { path = "/test/x.epub" } }, { b1 = {} })
+    assert(Library.noteLocalMove(st, "/lib/test/x.epub", "/somewhere/else/x.epub") == nil,
+        "out of the library is out of scope")
+    assert(Library.noteLocalMove(st, "/elsewhere/x.epub", "/lib/test/x.epub") == nil)
+end)
+
+test("moving a file onto itself is not a move", function()
+    local st = fakeStore({ b1 = { path = "/test/x.epub" } }, { b1 = {} })
+    assert(Library.noteLocalMove(st, "/lib/test/x.epub", "/lib/test/x.epub") == nil)
+end)
+
 io.write(string.format("PASS %d  FAIL %d\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

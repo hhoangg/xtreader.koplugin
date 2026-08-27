@@ -245,6 +245,55 @@ function Library.moveOnServer(api, id, new_path)
     return false, tostring(code)
 end
 
+--- Record that the reader just moved a book, before any sync happens.
+--
+-- Called from the file-manager patch the moment a move succeeds, and it exists
+-- for one visible symptom: without it the book sits in its new folder AND
+-- appears as a placeholder in its old one until the next sync, because the
+-- placeholder providers look for each catalogue entry at the path the catalogue
+-- records and that path is now empty.
+--
+-- Two writes, and they do different jobs:
+--
+--   catalogue.path  moved immediately. This is what the providers read, so
+--                   correcting it is what makes the phantom never appear.
+--   pending_move    remembered on the ledger so the next sync knows to PUSH
+--                   this rather than having to rediscover it by hashing.
+--
+-- `library.path` is deliberately NOT touched. It holds what the SERVER thinks,
+-- and pass 1 renames the local file whenever the two disagree -- so writing the
+-- new path there would have the next sync move the book back.
+--
+-- Returns the book id, or nil when this was not a book the account knows.
+function Library.noteLocalMove(store, from_abs, to_abs)
+    local root = store:get("library_dir")
+    if not root or type(from_abs) ~= "string" or type(to_abs) ~= "string" then
+        return nil
+    end
+    root = root:gsub("/+$", "")
+    if from_abs:sub(1, #root + 1) ~= root .. "/" then return nil end
+    if to_abs:sub(1, #root + 1) ~= root .. "/" then return nil end
+
+    local from_rel = from_abs:sub(#root + 1)
+    local to_rel   = to_abs:sub(#root + 1)
+    if from_rel == to_rel then return nil end
+
+    for id, known in store:eachBook() do
+        if known.path == from_rel then
+            known.pending_move = to_rel
+            store:setBook(id, known)
+            local cat = store:getCatalogueEntry(id)
+            if cat then
+                cat.path = to_rel
+                store:setCatalogueEntry(id, cat)
+            end
+            store:flush()
+            return id
+        end
+    end
+    return nil
+end
+
 function Library.reportInventory(api, store)
     local lfs = require("libs/libkoreader-lfs")
     local root = store:get("library_dir")
@@ -416,13 +465,30 @@ function Library.sync(api, store, report)
             --
             -- Only asked when the ledger knew about the book: a path that was
             -- never held here cannot have been moved from it.
-            local moved_to = known and findMovedTo(root, entry.path, entry.contentHash)
+            -- A move the file manager already told us about needs no search:
+            -- we watched it happen. The hash hunt below is the fallback for a
+            -- move made outside KOReader -- over USB, or from a shell.
+            local moved_to
+            if known and known.pending_move then
+                local cand = localPathFor(root, known.pending_move)
+                if lfs.attributes(cand, "mode") == "file" then
+                    moved_to = cand
+                else
+                    -- The reader moved it again, or moved it back, or deleted
+                    -- it. The note is stale and worth less than a fresh look.
+                    known.pending_move = nil
+                    store:setBook(id, known)
+                end
+            end
+            moved_to = moved_to
+                       or (known and findMovedTo(root, entry.path, entry.contentHash))
             if moved_to then
                 local new_rel = moved_to:sub(#root + 1)
                 local ok_move, move_err = Library.moveOnServer(api, id, new_rel)
                 if ok_move then
                     known.path = new_rel
                     known.move_conflict = nil
+                    known.pending_move = nil
                     store:setBook(id, known)
                     -- The CATALOGUE too, not just the ledger.
                     --
