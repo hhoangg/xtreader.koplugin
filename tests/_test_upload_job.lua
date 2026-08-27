@@ -128,6 +128,48 @@ test("dismiss refuses while a job is running", function()
     assert(Job.dismiss() == false, "nothing to dismiss should be false, not an error")
 end)
 
+-- ---------------------------------------------------------------- crashes
+
+test("a missing state file is nil, not an error", function()
+    -- This runs from UIManager's scheduler, where a raised error is caught by
+    -- nothing. It raised once on the device -- /mnt/us is FUSE, not POSIX, so a
+    -- handle opened while the file is being replaced can fail on the READ,
+    -- after io.open has already succeeded -- and dropped the reader back to the
+    -- Kindle home screen mid-upload.
+    os.remove(SCRATCH .. "/cache/xtreader-upload.state")
+    local ok, res = pcall(Job.readState)
+    assert(ok, "readState must not raise: " .. tostring(res))
+    assert(res == nil, "a missing file is nothing to report, got " .. tostring(res))
+end)
+
+test("a truncated state file parses as far as it got", function()
+    -- A reader can see the file mid-write. Half the counters is a stale card
+    -- for one second; an exception is a closed application.
+    local path = SCRATCH .. "/cache/xtreader-upload.state"
+    local f = io.open(path, "w")
+    f:write("phase=running\ntotal=89\ndone=8\nbytes_do")   -- cut mid-key
+    f:close()
+    local ok, st = pcall(Job.readState)
+    assert(ok, "must not raise on a partial file: " .. tostring(st))
+    assert(st and st.done == 8, "what was written must still be readable")
+end)
+
+test("garbage in the file does not raise", function()
+    local path = SCRATCH .. "/cache/xtreader-upload.state"
+    local f = io.open(path, "w")
+    f:write("\0\1\2 not remotely a state file \255\254\n=\n=x\nbook=\n")
+    f:close()
+    local ok = pcall(Job.readState)
+    assert(ok, "must survive whatever is in the file")
+end)
+
+test("writeState reports failure rather than raising", function()
+    -- Called from inside a forked child, where an error is silent and the
+    -- parent would simply never see another update.
+    local ok, res = pcall(Job.writeState, { phase = "running" })
+    assert(ok, "writeState must not raise: " .. tostring(res))
+end)
+
 os.remove(SCRATCH .. "/cache/xtreader-upload.state")
 io.write(string.format("PASS %d  FAIL %d\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

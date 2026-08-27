@@ -78,7 +78,23 @@ end
 -- Written to a temporary path and renamed, which is atomic within a directory,
 -- so a reader never sees a partial file at all in the normal case.
 
+-- Forward declaration: writeState wraps this, and a local has to exist before
+-- the wrapper closes over it or the call resolves to a global at run time.
+local writeStateUnsafe
+
+--- Never raises. The child writes this from inside a forked process where an
+--- error is silent, and the parent from its own paths; neither wants a full
+--- disk to be fatal.
 local function writeState(t)
+    local ok, res = pcall(writeStateUnsafe, t)
+    if not ok then
+        logger.warn("xtreader: could not write upload state:", tostring(res))
+        return false
+    end
+    return res
+end
+
+writeStateUnsafe = function(t)
     local path = statePath()
     local tmp = path .. ".tmp"
     local f = io.open(tmp, "w")
@@ -102,24 +118,60 @@ local function writeState(t)
     return os.rename(tmp, path)
 end
 
+-- Returns nil on ANY failure, and never raises.
+--
+-- It raised once, and it took KOReader down with it -- back to the Kindle home
+-- screen, mid-upload:
+--
+--     luajit: upload_job.lua:109: No such file or directory
+--       in function 'readState'
+--       in function 'action'          <- the poll
+--       uimanager.lua:1019 _checkTasks
+--
+-- Two things went wrong and both are worth naming.
+--
+-- The mechanism: /mnt/us on a Kindle is `fuse.fsp`, not a POSIX filesystem.
+-- The write side removes the old file and renames the new one over it, which on
+-- a real filesystem gives a reader either the old contents or the new ones and
+-- never an error. FUSE makes no such promise: a handle opened as that swap
+-- happens can fail on the READ, after io.open has already succeeded. So the nil
+-- check on io.open was never enough.
+--
+-- The consequence, which is the more important half: this runs from UIManager's
+-- scheduler, and an error raised there is not caught by anything. A progress
+-- display that cannot read a status file should show a stale figure for one
+-- second. It should not be able to close the application.
 local function readState()
-    local f = io.open(statePath(), "r")
-    if not f then return nil end
-    local t = { books = {} }
-    for line in f:lines() do
-        local k, v = line:match("^([%w_]+)=(.*)$")
-        if k == "book" then
-            local id, path, hash, size = v:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t(.*)$")
-            if id then
-                t.books[#t.books + 1] = { id = id, path = path, hash = hash,
-                                          size = tonumber(size) }
+    local ok, result = pcall(function()
+        local f = io.open(statePath(), "r")
+        if not f then return nil end
+        local t = { books = {} }
+        -- read("*a") then split, rather than f:lines(): lines() is an iterator
+        -- that raises mid-loop, so a failure part-way through a file cannot be
+        -- distinguished from a failure to open it, and a partial parse is
+        -- abandoned rather than returned.
+        local body = f:read("*a")
+        f:close()
+        if not body then return nil end
+        for line in body:gmatch("[^\n]+") do
+            local k, v = line:match("^([%w_]+)=(.*)$")
+            if k == "book" then
+                local id, path, hash, size = v:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t(.*)$")
+                if id then
+                    t.books[#t.books + 1] = { id = id, path = path, hash = hash,
+                                              size = tonumber(size) }
+                end
+            elseif k then
+                t[k] = tonumber(v) or v
             end
-        elseif k then
-            t[k] = tonumber(v) or v
         end
+        return t
+    end)
+    if not ok then
+        logger.warn("xtreader: could not read upload state:", tostring(result))
+        return nil
     end
-    f:close()
-    return t
+    return result
 end
 
 Job.writeState = writeState
@@ -275,19 +327,41 @@ function Job.start(api, store, Upload)
 
     -- Poll. Cheap, and the only thing standing between the child and a card
     -- that never updates.
+    -- EVERY path in here is wrapped, not just the file read.
+    --
+    -- This runs from UIManager's scheduler, where a raised error is caught by
+    -- nothing and closes the application. That is not theoretical: readState
+    -- raised on a FUSE filesystem mid-upload and dropped the reader back to the
+    -- Kindle home screen. readState is now safe on its own, but so is
+    -- everything else here -- isSubProcessDone goes through FFI, and _commit
+    -- writes to the settings store, and neither is a thing to bet a running
+    -- application on.
+    --
+    -- A poll that fails is a card showing a stale figure for a second. It is
+    -- never worth more than that.
     job.poll = function()
-        local st = readState()
-        if st then job.st = st end
-        local done = ffiutil.isSubProcessDone(pid)
-        if done then
-            job.pid = nil
-            local committed = Job._commit()
-            job.st = job.st or {}
-            if job.st.phase == "running" then job.st.phase = "done" end
-            logger.dbg("xtreader: upload job finished, committed", committed, "books")
-            return
+        local ok, err = pcall(function()
+            local st = readState()
+            if st then job.st = st end
+            if ffiutil.isSubProcessDone(pid) then
+                job.pid = nil
+                local committed = Job._commit()
+                job.st = job.st or {}
+                if job.st.phase == "running" then job.st.phase = "done" end
+                logger.dbg("xtreader: upload job finished, committed", committed, "books")
+                return true   -- finished: do not reschedule
+            end
+            return false
+        end)
+        if not ok then
+            logger.warn("xtreader: upload poll failed:", tostring(err))
+            -- Keep polling. The job itself is in another process and is
+            -- unaffected by whatever went wrong in here.
+            err = false
         end
-        UIManager:scheduleIn(POLL_SEC, job.poll)
+        if err ~= true then
+            UIManager:scheduleIn(POLL_SEC, job.poll)
+        end
     end
     UIManager:scheduleIn(POLL_SEC, job.poll)
     return true
