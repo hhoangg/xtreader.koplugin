@@ -81,6 +81,83 @@ end
 
 --- Runs a full library sync. Must be called inside a Trapper:wrap.
 -- `report(text)` returns false when the user asked to stop.
+--- The server id of the book sitting at `local_path`, plus its recorded entry.
+--
+-- Walks the index rather than keeping a reverse map: a library is hundreds of
+-- entries, this runs once when a delete dialog opens, and a second map would be
+-- one more thing to keep in step with `path` changing under a rename.
+--
+-- Returns nil for a side-loaded file, which is the answer that matters -- a book
+-- the server never had must never be reported to the server as deleted.
+function Library.idForLocalPath(store, local_path)
+    local root = store:get("library_dir")
+    if not root or not local_path then
+        return nil
+    end
+    for id, known in store:eachBook() do
+        if known.path and localPathFor(root, known.path) == local_path then
+            return id, known
+        end
+    end
+    return nil
+end
+
+--- Deletes a book on the server and drops it from the local index.
+--
+-- The index entry is removed ONLY after the server confirms. A local index that
+-- has forgotten a book the server still lists is not a small error: the next
+-- sync sees an entry it has no record of and downloads the whole thing again.
+function Library.forget(api, store, id)
+    local ok, code = api:delete("/library/" .. id)
+    if not ok then
+        return false, code
+    end
+    store:removeBook(id)
+    store:flush()
+    return true
+end
+
+--- Tells the server which books this device actually holds.
+--
+-- A full snapshot every time, never a diff. The server keeps `device_books` so
+-- the web UI can refuse to delete the last copy of something silently -- and
+-- for that to be worth anything the picture has to be true, not merely
+-- eventually true.
+--
+-- Reporting events instead ("downloaded X", "deleted Y") would be smaller and
+-- would drift permanently the first time one went missing: a sync that dies
+-- mid-way, a flat battery, a file deleted from the file manager, a device
+-- restored from a backup. Nothing downstream could detect the divergence. A
+-- snapshot cannot drift, and re-sending it costs nothing -- the whole payload
+-- is about 2 KB for this library and 51 KB for a two-thousand-book one.
+--
+-- Only ids whose file is ACTUALLY on disk are sent. The local index remembers
+-- what was downloaded, which is not the same as what is still there; a book
+-- deleted outside this plugin would otherwise be reported forever as held.
+function Library.reportInventory(api, store)
+    local lfs = require("libs/libkoreader-lfs")
+    local root = store:get("library_dir")
+    if not root then
+        return false, "no_library_dir"
+    end
+
+    local ids = {}
+    for id, known in store:eachBook() do
+        if known.path and lfs.attributes(localPathFor(root, known.path), "mode") == "file" then
+            ids[#ids + 1] = id
+        end
+    end
+
+    -- An empty list is a legitimate answer -- a device that has downloaded
+    -- nothing yet -- and the server has to hear it, or it would go on believing
+    -- this device holds whatever it held last time.
+    local body, code = api:postJson("/devices/inventory", { bookIds = ids })
+    if not body then
+        return false, code
+    end
+    return true, tonumber(body.stored) or #ids
+end
+
 function Library.sync(api, store, report)
     local root = store:get("library_dir")
     if not ensureDir(root) then
@@ -100,7 +177,31 @@ function Library.sync(api, store, report)
         end
     end
 
+    -- Remember the account's list, not just what we ended up downloading.
+    --
+    -- Without this the device can only see books it holds, and a book it does
+    -- not hold is indistinguishable from one that does not exist -- which is
+    -- exactly the distinction a placeholder is.
+    --
+    -- Written before the passes below, so the catalogue reflects what the
+    -- server said even if a download later fails.
+    local catalogue = {}
+    for id, e in pairs(server) do
+        catalogue[id] = {
+            path = e.path,
+            hash = e.contentHash,
+            size = e.sizeBytes,
+            unavailable = e.unavailable == true or nil,
+        }
+    end
+    store:setCatalogue(catalogue)
+
     local renamed, downloaded, deleted, failed = 0, 0, 0, 0
+
+    -- Off by default. Pulling every book onto every reader is the wrong shape
+    -- once an account outgrows the smallest card on it, and it is the behaviour
+    -- that makes a local delete meaningless.
+    local auto_download = G_reader_settings:isTrue("xtreader_auto_download")
 
     -- Pass 1: renames.
     for id, entry in pairs(server) do
@@ -167,7 +268,32 @@ function Library.sync(api, store, report)
         local known = store:getBook(id)
         local target = localPathFor(root, entry.path)
         local on_disk = lfs.attributes(target, "mode") == "file"
-        if not on_disk or not known or known.hash ~= entry.contentHash then
+        if entry.unavailable == true then
+            -- The account still lists it; the bytes are gone. Queueing it would
+            -- spend a request to be told 404 file_deleted, once per sync,
+            -- forever. A copy already on the card stays exactly where it is --
+            -- being the last holder of a book is not a reason to lose it.
+            if on_disk and known and known.path ~= entry.path then
+                known.path = entry.path
+                store:setBook(id, known)
+            end
+        elseif not on_disk and not auto_download then
+            -- On demand: the account lists it, this card does not have it, and
+            -- that is a placeholder rather than a job.
+            --
+            -- This is the line that makes deleting a book locally mean
+            -- something. While sync fetched everything missing, a delete was
+            -- undone by the next sync -- so "remove this from my device" was
+            -- not an operation the reader could actually perform, and no
+            -- placeholder could exist long enough to be seen.
+            --
+            -- Note it deliberately does not fire for a book that IS on disk with
+            -- a stale hash: a changed file still gets re-fetched, because that
+            -- is a different intent from having deleted it.
+            if known then
+                store:removeBook(id)
+            end
+        elseif not on_disk or not known or known.hash ~= entry.contentHash then
             pending[#pending + 1] = { id = id, entry = entry, target = target }
         elseif known.path ~= entry.path then
             known.path = entry.path

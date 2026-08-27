@@ -62,6 +62,14 @@ function Store:open()
     end
     self.data = self.obj:readSetting("config", seed)
     self.library = self.obj:readSetting("library", {})
+    -- The account's whole book list, downloaded or not.
+    --
+    -- `library` answers "what did we put on this card"; `catalogue` answers
+    -- "what does the account have". They are deliberately separate: a book the
+    -- reader has not downloaded still has to be shown, in the right folder,
+    -- with a way to fetch it -- and the only place that fact can live between
+    -- syncs is here.
+    self.catalogue = self.obj:readSetting("catalogue", {})
     for k, v in pairs(Store.DEFAULTS) do
         if self.data[k] == nil then
             self.data[k] = v
@@ -94,7 +102,9 @@ function Store:clearCredentials()
     self:set("kosync_username", nil)
     self:set("kosync_key", nil)
     self.library = {}
+    self.catalogue = {}
     self.obj:saveSetting("library", self.library)
+    self.obj:saveSetting("catalogue", self.catalogue)
     self:flush()
 end
 
@@ -117,12 +127,32 @@ function Store:eachBook()
     return pairs(self.library)
 end
 
+--- The account's catalogue: every book the server lists, held or not.
+--
+-- Replaced wholesale by a full manifest rather than merged, for the same
+-- reason the inventory report is a snapshot: a merge cannot express removal,
+-- so a book dropped from the account would linger here as a placeholder
+-- nobody can explain and nothing can clear.
+function Store:setCatalogue(entries)
+    self.catalogue = entries or {}
+    self.dirty = true
+end
+
+function Store:getCatalogueEntry(id)
+    return self.catalogue[id]
+end
+
+function Store:eachCatalogueEntry()
+    return pairs(self.catalogue)
+end
+
 function Store:flush()
     if not self.obj then
         return
     end
     self.obj:saveSetting("config", self.data)
     self.obj:saveSetting("library", self.library)
+    self.obj:saveSetting("catalogue", self.catalogue)
     self.obj:flush()
     self.dirty = nil
 end
