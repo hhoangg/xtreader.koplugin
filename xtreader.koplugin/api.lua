@@ -277,4 +277,72 @@ function Api:downloadTo(path, dest, expected_size, progress_cb)
     return true
 end
 
+--- Stream one local file to the server as a raw body.
+--
+-- `query` is the already-escaped query string the endpoint wants; the caller
+-- owns escaping because it owns the values.
+--
+-- Returns `entry, nil` on 201, or `nil, code` otherwise. The CODE is returned
+-- rather than a message because the caller has to branch on it -- 409 means
+-- "already there", 403 means "this reader is not the upload source", and those
+-- are different outcomes, not two flavours of failure.
+--
+-- Streamed with ltn12 rather than read into a string: a 100 MiB book held whole
+-- in memory on a device with ~256 MB is how a reader gets OOM-killed halfway
+-- through a bulk push.
+--
+-- Content-Length is mandatory and is taken from the filesystem, not from a
+-- caller-supplied figure. S3 rejects a streamed PUT without one, so a wrong
+-- length does not fail politely -- it fails after the bytes have been sent.
+function Api:uploadFile(path, query, local_path, progress_cb)
+    local lfs = require("libs/libkoreader-lfs")
+    local attr = lfs.attributes(local_path)
+    if not attr or attr.mode ~= "file" then
+        return nil, "not_a_file"
+    end
+    local handle, io_err = io.open(local_path, "rb")
+    if not handle then
+        return nil, io_err or "cannot_open"
+    end
+
+    local source = ltn12.source.file(handle)
+    if progress_cb then
+        local sent = 0
+        local inner = source
+        source = function()
+            local chunk, err = inner()
+            if chunk then
+                sent = sent + #chunk
+                progress_cb(sent)
+            end
+            return chunk, err
+        end
+    end
+
+    local url = self:baseUrl() .. path
+    if query and query ~= "" then url = url .. "?" .. query end
+
+    local sink = {}
+    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+    local code, _, status = socket.skip(1, http.request({
+        url     = url,
+        method  = "POST",
+        headers = self:authHeaders({
+            ["Content-Type"]   = "application/octet-stream",
+            ["Content-Length"] = tostring(attr.size),
+        }),
+        source   = source,
+        sink     = ltn12.sink.table(sink),
+        redirect = false,
+    }))
+    socketutil:reset_timeout()
+    pcall(function() handle:close() end)
+
+    if code ~= 201 and code ~= 200 then
+        logger.warn("xtreader: upload failed:", status or code, local_path)
+        return nil, code
+    end
+    return decodeJson(table.concat(sink)) or {}, nil
+end
+
 return Api

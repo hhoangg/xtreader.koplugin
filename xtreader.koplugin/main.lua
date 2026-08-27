@@ -326,6 +326,28 @@ function Xtreader:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = _("Upload this device's books"),
+                enabled_func = function() return self.store:isPaired() end,
+                help_text = _("Sends every book in your books folder that the account does not already have, so books that exist only on this device become account books and survive it.\n\nOnly one reader per account may upload, chosen in the device list on the web. Until one is chosen this is refused, and it is refused before anything is sent.\n\nBooks already on the account are skipped without being sent again."),
+                callback = function()
+                    local Upload = require("upload")
+                    self:runSync(function(report)
+                        return Upload.pushAll(self.api, self.store, report)
+                    end, { beat = true })
+                end,
+            },
+            {
+                text = _("Check what would be uploaded"),
+                enabled_func = function() return self.store:isPaired() end,
+                help_text = _("Counts and measures without sending anything: how many books the account does not have, how many it already has, and how many sit at a path the account gives to a different book.\n\nRun this first. It cannot tell you whether this reader is allowed to upload -- the server only answers that when something is actually sent."),
+                callback = function()
+                    local Upload = require("upload")
+                    self:runSync(function(report)
+                        return Upload.dryRun(self.api, self.store, report)
+                    end)
+                end,
+            },
+            {
                 text = _("Send reading statistics"),
                 enabled_func = function() return self.store:isPaired() end,
                 help_text = _("Uploads KOReader's own per-page reading records so the web dashboard can show streaks, heatmaps and reading time across every reader on the account. Reads the statistics database, never writes to it."),
@@ -378,6 +400,38 @@ function Xtreader:addToMainMenu(menu_items)
             {
                 text = _("Books folder"),
                 callback = function() self:editSetting("library_dir", _("Books folder")) end,
+            },
+            {
+                text = _("Folders to leave out of uploads"),
+                help_text = _("Comma-separated names of top-level folders inside your books folder that \"Upload this device's books\" should skip.\n\nWorth setting before the first upload: a folder of original Kindle files that were converted to EPUB and filed elsewhere would otherwise put every one of those books on the account twice, and DRM-protected purchases would upload bytes that cannot be opened anywhere else.\n\nOnly matches at the top level. Leave empty to upload everything."),
+                callback = function()
+                    local dialog
+                    dialog = InputDialog:new({
+                        title = _("Folders to leave out of uploads"),
+                        input = tostring(self.store:get("upload_skip") or ""),
+                        input_hint = _("Downloads, dictionaries"),
+                        buttons = { {
+                            { text = _("Cancel"), id = "close",
+                              callback = function() UIManager:close(dialog) end },
+                            {
+                                text = _("Save"),
+                                is_enter_default = true,
+                                callback = function()
+                                    -- Saved even when empty, unlike editSetting:
+                                    -- clearing the list is a thing a reader will
+                                    -- want to do, and a Save that silently keeps
+                                    -- the old value is worse than no button.
+                                    local value = dialog:getInputText() or ""
+                                    self.store:set("upload_skip", (value:gsub("^%s+", ""):gsub("%s+$", "")))
+                                    self.store:flush()
+                                    UIManager:close(dialog)
+                                end,
+                            },
+                        } },
+                    })
+                    UIManager:show(dialog)
+                    dialog:onShowKeyboard()
+                end,
             },
             {
                 text = _("Wallpapers folder"),
