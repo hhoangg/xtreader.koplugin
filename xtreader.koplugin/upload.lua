@@ -278,7 +278,16 @@ end
 -- an aborted body is a partial object the server would have to clean up.
 --
 -- Returns ok, message, stats.
-function Upload.pushAll(api, store, report)
+-- `opts` is how the background job drives the same loop it drives in the
+-- foreground, rather than there being two copies of it to drift apart:
+--
+--   opts.books    a scan already done by the caller, so the job can size the
+--                 work before forking and the child does not walk twice
+--   opts.on_book  called with the running totals after each book. The
+--                 background job writes them to its state file; the foreground
+--                 run does not set it.
+function Upload.pushAll(api, store, report, opts)
+    opts = opts or {}
     if not store:isPaired() then
         return false, _("Pair this device with xtreader first.")
     end
@@ -287,7 +296,8 @@ function Upload.pushAll(api, store, report)
         return false, _("No library folder is configured.")
     end
 
-    local books = Upload.scan(root, store:get("upload_skip"), store:get("upload_formats"))
+    local books = opts.books
+                  or Upload.scan(root, store:get("upload_skip"), store:get("upload_formats"))
     if #books == 0 then
         return true, _("No books found to upload."), { total = 0 }
     end
@@ -309,20 +319,42 @@ function Upload.pushAll(api, store, report)
         total = #books, sent = 0, skipped = 0, conflict = 0,
         too_big = 0, failed = 0, forbidden = false,
     }
+    -- Accumulated for the progress card. Bytes rather than book count, because
+    -- a library where one book is 60 MB and the next is 300 KB makes "12 of 87"
+    -- a poor guide to how long is left.
+    local bytes_done, bytes_total = 0, 0
+    for _i, b in ipairs(books) do bytes_total = bytes_total + (b.size or 0) end
+    local started_at = os.time()
+    local accepted = {}
+
+    local function announce(current)
+        if not opts.on_book then return end
+        opts.on_book({
+            phase = "running", total = #books, done = stats.sent + stats.skipped
+                   + stats.conflict + stats.failed + stats.too_big,
+            sent = stats.sent, skipped = stats.skipped, conflict = stats.conflict,
+            failed = stats.failed, too_big = stats.too_big,
+            bytes_done = bytes_done, bytes_total = bytes_total,
+            started_at = started_at, current = current or "",
+            books = accepted,
+        })
+    end
     -- Paths the account holds under a DIFFERENT book. Collected rather than
     -- counted so the message can name them: "3 conflicts" is not something the
     -- owner can act on, and acting on it is the only reason to report it.
     local conflicts = {}
 
-    -- Set when the reader aborts DURING a book rather than between two. The
-    -- upload itself is not cut short -- an abandoned body is a partial object
-    -- the server has to clean up -- so the flag is checked at the top of the
-    -- next iteration instead.
-    local aborted = false
+    -- Set when the loop stops early, so the summary can say so rather than
+    -- reading like a completed run that happened to send fewer books.
+    local stopped = false
 
     for i, b in ipairs(books) do
-        if aborted then break end
-        if report(T(_("Uploading %1 of %2:\n%3"), i, #books, b.rel)) == false then
+        -- Size included because this is the ONLY moment an abort is possible:
+        -- the upload below cannot be interrupted, so the reader deciding
+        -- whether to stop needs to know how long they are committing to.
+        if report(T(_("Uploading %1 of %2 (%3 MB)\n%4"),
+                    i, #books, string.format("%.1f", b.size / 1048576), b.rel)) == false then
+            stopped = true
             break
         end
 
@@ -348,37 +380,40 @@ function Upload.pushAll(api, store, report)
                 else
                     local query = "path=" .. Upload.escape(b.rel)
                                   .. "&contentHash=" .. Upload.escape(hash)
-                    -- THE STOP BUTTON LIVES HERE, and it is not decoration.
+                    -- NO PROGRESS CALLBACK, AND IT CANNOT HAVE ONE.
                     --
-                    -- Trapper only repaints -- and only notices a tap -- when
-                    -- the coroutine yields, and `report` is what yields. Called
-                    -- once per book, as it was, a 10 MB upload is minutes in a
-                    -- blocking socket loop with no yield in it: the pause
-                    -- dialog cannot be drawn at the one moment somebody wants
-                    -- it, so the reader taps a frozen screen and concludes the
-                    -- device has hung. Reported on the device, and the only way
-                    -- out was a signal over SSH.
+                    -- A previous version reported progress from inside the
+                    -- upload's own byte pump, to give the coroutine a yield
+                    -- point per chunk so the pause dialog could be drawn while
+                    -- a book was in flight. It cannot work: `report` is
+                    -- Trapper:info, which YIELDS, and the pump is driven from
+                    -- inside LuaSocket's `http.request` -- a C function. Lua
+                    -- cannot yield across a C call boundary, so the first
+                    -- upload died with exactly that error and took the whole
+                    -- run with it.
                     --
-                    -- Reporting from inside the upload's own byte pump gives
-                    -- the coroutine a yield point every chunk. Throttled to
-                    -- whole percent steps because `report` repaints e-ink and
-                    -- doing that per 8 KB chunk would cost more than the
-                    -- transfer.
-                    local last_pct = -1
-                    local sent_cb = function(sofar)
-                        local pct = math.floor((sofar / math.max(1, b.size)) * 100)
-                        if pct > last_pct then
-                            last_pct = pct
-                            if report(T(_("Uploading %1 of %2 — %3%%\n%4"),
-                                        i, #books, pct, b.rel)) == false then
-                                aborted = true
-                            end
-                        end
-                    end
-                    local entry, up_code = api:uploadFile("/library/upload", query,
-                                                          b.path, sent_cb)
+                    -- The unit test did not catch it, and could not have as
+                    -- written: it drove the callback from Lua, so the yield had
+                    -- no C frame to cross. A test that calls your callback from
+                    -- a friendlier place than production does is a test that
+                    -- can only confirm what you already believe.
+                    --
+                    -- So the honest position: a blocking LuaSocket request
+                    -- cannot be interrupted from Lua, and an abort takes effect
+                    -- BETWEEN books. At ~2 MB/s that is a few seconds for a
+                    -- typical book and under a minute for the largest the
+                    -- server accepts. The progress line above says which book
+                    -- and how big it is, so the wait is at least explained.
+                    local entry, up_code = api:uploadFile("/library/upload", query, b.path)
                     if entry then
                         stats.sent = stats.sent + 1
+                        bytes_done = bytes_done + (b.size or 0)
+                        if entry.id then
+                            accepted[#accepted + 1] = {
+                                id = entry.id, path = entry.path or b.rel,
+                                hash = hash, size = b.size or 0,
+                            }
+                        end
                         -- Record it the way a sync would, so the next inventory
                         -- report counts it and the next sync does not fetch
                         -- back the book we just sent.
@@ -405,10 +440,21 @@ function Upload.pushAll(api, store, report)
                 end
             end
         end
+        announce(b.rel)
+    end
+    if opts.on_book then
+        opts.on_book({
+            phase = "done", total = #books,
+            done = stats.sent + stats.skipped + stats.conflict + stats.failed + stats.too_big,
+            sent = stats.sent, skipped = stats.skipped, conflict = stats.conflict,
+            failed = stats.failed, too_big = stats.too_big,
+            bytes_done = bytes_done, bytes_total = bytes_total,
+            started_at = started_at, current = "", books = accepted,
+        })
     end
     store:flush()
 
-    if aborted then
+    if stopped then
         local done = { T(_("Stopped. %1 uploaded so far"), stats.sent) }
         if stats.skipped > 0 then done[#done + 1] = T(_("%1 already there"), stats.skipped) end
         return true, table.concat(done, ", ") .. ".\n\n"

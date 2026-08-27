@@ -331,10 +331,22 @@ function Xtreader:addToMainMenu(menu_items)
                 help_text = _("Sends every book in your books folder that the account does not already have, so books that exist only on this device become account books and survive it.\n\nOnly one reader per account may upload, chosen in the device list on the web. Until one is chosen this is refused, and it is refused before anything is sent.\n\nBooks already on the account are skipped without being sent again."),
                 callback = function()
                     local Upload = require("upload")
+                    -- Backgrounded, not run inline. A blocking upload owns the
+                    -- Lua VM for as long as it takes -- the reader cannot turn a
+                    -- page, and cannot even stop it, because the pause dialog
+                    -- needs a yield that a C call will not give. The job forks
+                    -- instead, and the control centre shows how far it has got.
                     local function go()
-                        self:runSync(function(report)
-                            return Upload.pushAll(self.api, self.store, report)
-                        end, { beat = true })
+                        local NetworkMgr = require("ui/network/manager")
+                        NetworkMgr:runWhenOnline(function()
+                            local Job = require("upload_job")
+                            local ok_start, why = Job.start(self.api, self.store, Upload)
+                            if not ok_start then
+                                notify(tostring(why), 6)
+                                return
+                            end
+                            notify(_("Uploading in the background.\n\nPull down the control centre to see how far it has got, or to stop it."), 6)
+                        end)
                     end
                     -- Ask once when nothing is excluded.
                     --

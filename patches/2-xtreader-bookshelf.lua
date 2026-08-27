@@ -28,7 +28,10 @@ sees the same books in both.
 
 local logger = require("logger")
 local userpatch = require("userpatch")
+local ConfirmBox = require("ui/widget/confirmbox")
+local UIManager = require("ui/uimanager")
 local _ = require("gettext")
+local T = require("ffi/util").template
 
 --- The live xtreader plugin instance, or nil.
 --
@@ -210,6 +213,72 @@ local function opener(book, done, progress)
     end)
 end
 
+--- Human sizes. MB throughout rather than switching to GB past 1024: a bulk
+--- upload is measured in hundreds of MB, and a unit that changes halfway
+--- through makes two readings harder to compare than one big number.
+local function mb(bytes)
+    return string.format("%.0f", (tonumber(bytes) or 0) / 1048576)
+end
+
+local function humanEta(seconds)
+    if not seconds then return nil end
+    if seconds < 90 then return T(_("%1s left"), math.floor(seconds)) end
+    return T(_("%1 min left"), math.floor(seconds / 60 + 0.5))
+end
+
+--- What the control centre draws while a bulk upload runs, or nil.
+local function uploadCard()
+    local ok, Job = pcall(require, "upload_job")
+    if not ok then return nil end
+    local st = Job.state()
+    if not st then return nil end
+
+    local running = st.phase == "running"
+    if running then
+        local bits = { T(_("Uploading %1 of %2"), st.done or 0, st.total or 0) }
+        local rate = Job.rate(st)
+        if rate then bits[#bits + 1] = T(_("%1 MB/s"), string.format("%.1f", rate / 1048576)) end
+        local eta = humanEta(Job.eta(st))
+        if eta then bits[#bits + 1] = eta end
+        local frac = (st.bytes_total or 0) > 0 and (st.bytes_done or 0) / st.bytes_total or nil
+        return {
+            title    = table.concat(bits, " \u{00B7} "),
+            right    = frac and string.format("%d%%", math.floor(frac * 100)) or nil,
+            progress = frac,
+            running  = true,
+            on_close = function()
+                -- Asked, because this throws away work that has already been
+                -- spent. Dismissing a finished card below does not, and the two
+                -- are the same tap in the same place -- so only one of them
+                -- gets to be instant.
+                UIManager:show(ConfirmBox:new{
+                    text = T(_("Stop uploading?\n\n%1 of %2 books have been sent. What has gone up stays on your account, and starting again carries on from there."),
+                             st.sent or 0, st.total or 0),
+                    ok_text = _("Stop"),
+                    ok_callback = function() Job.cancel() end,
+                    cancel_text = _("Keep going"),
+                })
+            end,
+        }
+    end
+
+    -- Finished, cancelled or failed: a notice that waits to be dismissed.
+    local head = st.phase == "cancelled" and _("Upload stopped")
+              or st.phase == "failed" and _("Upload failed")
+              or _("Upload finished")
+    local parts = { T(_("%1 sent"), st.sent or 0) }
+    if (st.skipped or 0) > 0  then parts[#parts + 1] = T(_("%1 already there"), st.skipped) end
+    if (st.conflict or 0) > 0 then parts[#parts + 1] = T(_("%1 name clashes"), st.conflict) end
+    if (st.failed or 0) > 0   then parts[#parts + 1] = T(_("%1 failed"), st.failed) end
+    return {
+        title    = head,
+        right    = tostring(st.sent or 0),
+        subtitle = table.concat(parts, " \u{00B7} ") .. " \u{00B7} " .. mb(st.bytes_done) .. " MB",
+        running  = false,
+        on_close = function() Job.dismiss() end,
+    }
+end
+
 userpatch.registerPatchPluginFunc("kindleui", function()
     local ok, Placeholders = pcall(require, "lib/bookshelf_placeholders")
     if not ok or type(Placeholders) ~= "table"
@@ -222,6 +291,14 @@ userpatch.registerPatchPluginFunc("kindleui", function()
     end
     Placeholders.setProvider(provider)
     Placeholders.setOpener(opener)
+
+    -- The upload card in the control centre. Optional on a kindleui without it,
+    -- for the same reason the folder provider is: this patch has to keep
+    -- working against a build that has one registry and not the other.
+    local ok_tc, TaskCard = pcall(require, "kindleui_taskcard")
+    if ok_tc and type(TaskCard) == "table" and type(TaskCard.setProvider) == "function" then
+        TaskCard.setProvider(uploadCard)
+    end
     -- Optional on older kindleui builds: registered only when present, so this
     -- patch keeps working against a version that has books but not folders.
     if type(Placeholders.setFolderProvider) == "function" then

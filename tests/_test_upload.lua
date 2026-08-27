@@ -1,15 +1,27 @@
 -- tests/_test_upload.lua
 --
--- The bulk push. Most of this file exists because of one bug that reached the
--- device: pushAll called `report` once per BOOK, and Trapper only repaints --
--- and only notices a tap -- when the coroutine yields, which is what `report`
--- does. So during a 10 MB upload there was no yield point for minutes, the
--- pause dialog could not be drawn at the one moment somebody wanted it, and
--- the only way to stop a running push was a signal over SSH.
+-- The bulk push.
 --
--- "The stop button exists" is not the property worth testing. "The stop button
--- can be drawn while a book is in flight" is, and that is a claim about how
--- often report is called.
+-- READ THIS BEFORE ADDING A PROGRESS TEST.
+--
+-- An earlier version of this file asserted that `report` was called many times
+-- per book, to prove the pause dialog could be drawn while a book was in
+-- flight. The assertion passed. The feature crashed on the device with
+--
+--     attempt to yield across C-call boundary
+--
+-- because `report` is Trapper:info, which yields, and the real callback runs
+-- inside LuaSocket's `http.request` -- a C function you cannot yield across.
+-- The test drove the callback from Lua, where there is no C frame in the way,
+-- so it was checking a version of the world that does not exist.
+--
+-- The lesson is not "test harder". It is that a stub which calls your callback
+-- from a friendlier place than production does can only ever confirm what you
+-- already believed. Where the call comes FROM was the whole property, and a
+-- table of fake books could not model it.
+--
+-- So: a blocking request cannot be interrupted from Lua, an abort takes effect
+-- between books, and the tests below assert that -- not a smoother story.
 
 package.path = "./xtreader.koplugin/?.lua;" .. package.path
 package.loaded["logger"]   = { warn = function() end, dbg = function() end }
@@ -91,42 +103,55 @@ local function harness(n, size)
     return api, store, state
 end
 
-test("report is called many times per book, not once", function()
+test("nothing is reported from inside the upload", function()
+    -- The property that actually matters, stated as what it is: `report`
+    -- yields, the upload runs inside a C call, and yielding across that is
+    -- fatal. So report must be called ONLY from the loop body, never from a
+    -- callback the request drives.
+    --
+    -- Asserted as an exact count rather than a bound: one per book, plus the
+    -- single "checking what the account has" line before the loop. A number
+    -- that drifts upward means somebody has reintroduced a callback and this
+    -- will die on a device again.
     local api, store, state = harness(3, 1024 * 1024)
     Upload.pushAll(api, store, function() state.reports = state.reports + 1; return true end)
-    -- One per book would be 3. Anything close to 3 means a book uploads with
-    -- no yield inside it and the pause dialog cannot be drawn.
-    assert(state.reports > 3 * 4,
-        "expected a yield point per chunk; got " .. state.reports .. " reports for 3 books")
+    assert(state.reports == 3 + 1,
+        "expected exactly one report per book plus one before the loop, got "
+        .. state.reports)
 end)
 
-test("progress is reported as whole percent steps, not per chunk", function()
-    -- Each report repaints e-ink. Reporting per 64 KB chunk would cost more
-    -- than the transfer it is describing.
-    local api, store, state = harness(1, 10 * 1024 * 1024)  -- 160 chunks
-    Upload.pushAll(api, store, function() state.reports = state.reports + 1; return true end)
-    assert(state.reports <= 105,
-        "expected throttling to ~100 steps + overhead, got " .. state.reports)
-    assert(state.reports > 10, "expected real progress reporting, got " .. state.reports)
+test("uploadFile is called without a progress callback", function()
+    -- Belt and braces for the same thing, checked at the seam rather than by
+    -- counting: whatever the loop does, it must not hand the request a
+    -- function to call.
+    local api, store, _state = harness(2, 1024)
+    local saw_callback = false
+    api.uploadFile = function(_s, _p, _q, _lp, cb)
+        if cb ~= nil then saw_callback = true end
+        return { id = "x", path = "/x" }, nil
+    end
+    Upload.pushAll(api, store, function() return true end)
+    assert(not saw_callback,
+        "a progress callback here yields across a C boundary and kills the run")
 end)
 
-test("aborting mid-book finishes that book, then stops", function()
-    -- Never mid-body: an abandoned upload is a partial object the server has
-    -- to clean up.
+test("stopping between books stops before the next upload", function()
+    -- The only kind of stop there is. An in-flight book cannot be interrupted,
+    -- which is why the progress line names its size: it is what the reader is
+    -- committing to when they let it start.
     local api, store, state = harness(5, 1024 * 1024)
     local n = 0
     local ok, msg, stats = Upload.pushAll(api, store, function()
         n = n + 1
-        return n < 3          -- refuse once the first book is in flight
+        return n < 3          -- allow the pre-loop line and book 1, refuse book 2
     end)
-    assert(state.uploads == 1,
-        "expected the in-flight book to finish and no more; uploaded " .. state.uploads)
-    assert(stats.sent == 1, "the finished book must still be counted, got " .. stats.sent)
-    assert(ok, "an abort is not a failure")
+    assert(state.uploads == 1, "expected one book sent then a stop, got " .. state.uploads)
+    assert(stats.sent == 1, "the sent book must be counted, got " .. stats.sent)
+    assert(ok, "stopping is not a failure")
     assert(tostring(msg):find("Stopped"), "the message must say it stopped: " .. tostring(msg))
 end)
 
-test("aborting between books stops without uploading another", function()
+test("stopping at the first prompt sends nothing at all", function()
     local api, store, state = harness(5, 1024)
     local first = true
     Upload.pushAll(api, store, function()
