@@ -397,33 +397,20 @@ function Upload.pushAll(api, store, report, opts)
                     conflicts[#conflicts + 1] = b.rel
                     logger.warn("xtreader: path held by a different book, not uploaded:", b.rel)
                 else
-                    local query = "path=" .. Upload.escape(b.rel)
-                                  .. "&contentHash=" .. Upload.escape(hash)
                     -- Per-chunk progress, but ONLY in the background job.
                     --
-                    -- This is the same callback that was fatal in the
-                    -- foreground, and the difference is what it does rather
+                    -- This is the same callback shape that was fatal in the
+                    -- foreground, and the difference is what it DOES rather
                     -- than where it is called from. `report` is Trapper:info,
-                    -- which YIELDS, and the pump runs inside LuaSocket's
-                    -- `http.request` -- a C function Lua cannot yield across.
-                    -- `on_book` writes a file. A write does not yield, so the
-                    -- C frame in between is nothing to it.
+                    -- which yields, inside a request driven by a C function Lua
+                    -- cannot yield across. `on_book` writes a file, and a write
+                    -- does not yield.
                     --
-                    -- Which is why it is gated on on_book and not offered to
-                    -- the foreground path: the foreground's reporter is the one
-                    -- that yields, and handing it to the request would kill the
-                    -- run exactly as it did before.
-                    --
-                    -- Without this the card sits still for the whole of a large
-                    -- book -- fifteen seconds and more at Kindle speeds -- and
-                    -- a progress bar that does not move is one nobody believes.
+                    -- Every 512 KB rather than every chunk: each tick rewrites
+                    -- the state file, and at 8 KB chunks that would be hundreds
+                    -- of writes per book to move a bar by a pixel.
                     local up_progress
                     if opts.on_book then
-                        -- Every 512 KB rather than every chunk: each tick
-                        -- rewrites the state file, and at 8 KB chunks that
-                        -- would be hundreds of writes per book to move a bar
-                        -- by a pixel. 512 KB is a quarter-second of transfer,
-                        -- comfortably finer than the parent's one-second poll.
                         local step = 512 * 1024
                         local next_at = step
                         up_progress = function(sofar)
@@ -432,25 +419,91 @@ function Upload.pushAll(api, store, report, opts)
                             announce(b.rel, sofar)
                         end
                     end
-                    local entry, up_code = api:uploadFile("/library/upload", query,
-                                                          b.path, up_progress)
+
+                    -- THREE STEPS, because the one-step proxy was the
+                    -- bottleneck rather than the network.
+                    --
+                    --   presign   ask the server for a signed storage URL
+                    --   PUT       send the bytes straight to storage
+                    --   complete  tell the server it landed
+                    --
+                    -- The old POST /library/upload put every byte through a
+                    -- Worker, and measured from this device that ran at 2 KB/s
+                    -- against 1.65 MB/s to the same CDN's own endpoint. Going
+                    -- direct to storage is ~23x faster on the same link.
+                    --
+                    -- contentHash goes to `complete`, not to `presign`: the
+                    -- signature only needs to know where the object lives.
+                    local grant, pre_code = api:postJson("/library/upload/presign",
+                                                         { path = b.rel })
+                    local entry, up_code
+                    if not grant or not grant.uploadUrl then
+                        up_code = pre_code
+                    else
+                        local ok_put, put_err = api:putFile(grant.uploadUrl, b.path,
+                                                            up_progress)
+                        if not ok_put then
+                            up_code = put_err
+                        else
+                            entry, up_code = api:postJson("/library/upload/complete", {
+                                bookId      = grant.bookId,
+                                path        = b.rel,
+                                contentHash = hash,
+                            })
+                            -- `upload_not_found` means the object is not in the
+                            -- bucket: a PUT that died partway looks exactly
+                            -- like this. The grant is spent either way, so the
+                            -- retry has to start from presign -- and it is one
+                            -- retry, not a loop, because a second failure is a
+                            -- pattern rather than a blip.
+                            if not entry and up_code == 400 then
+                                local g2 = api:postJson("/library/upload/presign",
+                                                        { path = b.rel })
+                                if g2 and g2.uploadUrl
+                                        and api:putFile(g2.uploadUrl, b.path, up_progress) then
+                                    entry, up_code = api:postJson("/library/upload/complete", {
+                                        bookId      = g2.bookId,
+                                        path        = b.rel,
+                                        contentHash = hash,
+                                    })
+                                end
+                            end
+                        end
+                    end
                     if entry then
                         stats.sent = stats.sent + 1
                         bytes_done = bytes_done + (b.size or 0)
                         bytes_sent = bytes_sent + (b.size or 0)
+                        -- The id off the RETURNED entry, never the one presign
+                        -- handed out. Uploading over a book that was deleted
+                        -- revives it in place and keeps its original id, so the
+                        -- two differ exactly when it matters most -- every
+                        -- reader still holding that file is keyed on the old
+                        -- one.
                         if entry.id then
-                            accepted[#accepted + 1] = {
-                                id = entry.id, path = entry.path or b.rel,
+                            local record = {
+                                path = entry.path or b.rel,
                                 hash = hash, size = b.size or 0,
                             }
-                        end
-                        -- Record it the way a sync would, so the next inventory
-                        -- report counts it and the next sync does not fetch
-                        -- back the book we just sent.
-                        if entry.id then
-                            store:setBook(entry.id, {
-                                path = entry.path or b.rel, hash = hash, size = b.size,
-                            })
+                            -- BOTH, and neither is redundant.
+                            --
+                            -- setBook is what a foreground run relies on; the
+                            -- accepted list is what a background one relies on,
+                            -- because a child's writes to the store live on a
+                            -- copy-on-write page and vanish when it exits, so
+                            -- the parent replays them from the state file.
+                            --
+                            -- Writing to the store in the child is harmless --
+                            -- it is thrown away with the process -- and leaving
+                            -- it out is not: the foreground path silently
+                            -- stopped recording anything when the list was
+                            -- introduced, and the next sync would have
+                            -- downloaded back every book it had just sent.
+                            store:setBook(entry.id, record)
+                            accepted[#accepted + 1] = {
+                                id = entry.id, path = record.path,
+                                hash = record.hash, size = record.size,
+                            }
                         end
                     elseif up_code == 403 then
                         -- Nobody is nominated, or somebody else is. Either way

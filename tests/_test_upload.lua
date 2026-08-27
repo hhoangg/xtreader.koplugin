@@ -88,16 +88,29 @@ local function harness(n, size)
         setBook = function(s, id, e) s._books[id] = e end,
         flush = function() end,
     }
-    local state = { uploads = 0, reports = 0 }
+    -- The three-step contract: presign, PUT to storage, complete. The proxy
+    -- that used to take the bytes ran at 2 KB/s measured from the device, so
+    -- they now go straight to storage and the server is only told about it.
+    local state = { uploads = 0, reports = 0, presigns = 0, completes = 0 }
     local api = {
         fetchManifest = function() return {} end,
-        uploadFile = function(_s, _p, _q, _lp, cb)
+        postJson = function(_s, path, payload)
+            if path == "/library/upload/presign" then
+                state.presigns = state.presigns + 1
+                return { bookId = "bok_" .. state.presigns,
+                         uploadUrl = "https://storage.example/put?sig=x" }, nil
+            elseif path == "/library/upload/complete" then
+                state.completes = state.completes + 1
+                return { id = payload.bookId, path = payload.path }, nil
+            end
+        end,
+        putFile = function(_s, _url, _lp, cb)
             state.uploads = state.uploads + 1
             -- Pump it in 64 KB chunks, the way the real ltn12 source does.
             for sofar = 65536, size, 65536 do
                 if cb then cb(sofar) end
             end
-            return { id = "bok_" .. state.uploads, path = "/x" }, nil
+            return true
         end,
     }
     return api, store, state
@@ -120,15 +133,64 @@ test("nothing is reported from inside the upload", function()
         .. state.reports)
 end)
 
+test("the id comes off the completed entry, not off presign", function()
+    -- Uploading over a book that was deleted revives it IN PLACE and keeps its
+    -- original id, so the two differ exactly when it matters most: every reader
+    -- still holding that file is keyed on the old one.
+    local api, store, _state = harness(1, 1024)
+    api.postJson = function(_s, path, payload)
+        if path == "/library/upload/presign" then
+            return { bookId = "bok_FRESH", uploadUrl = "https://s/put" }, nil
+        end
+        return { id = "bok_REVIVED", path = payload.path }, nil
+    end
+    Upload.pushAll(api, store, function() return true end)
+    assert(store._books["bok_REVIVED"], "must record the id the server settled on")
+    assert(not store._books["bok_FRESH"], "must not record presign's provisional id")
+end)
+
+test("a complete that says the object is missing retries from presign", function()
+    -- 400 upload_not_found is what a PUT that died halfway looks like. The
+    -- grant is spent, so a retry has to start over -- and it is ONE retry,
+    -- because a second failure is a pattern rather than a blip.
+    local api, store, state = harness(1, 1024)
+    local completes = 0
+    api.postJson = function(_s, path, payload)
+        if path == "/library/upload/presign" then
+            state.presigns = state.presigns + 1
+            return { bookId = "b" .. state.presigns, uploadUrl = "https://s/put" }, nil
+        end
+        completes = completes + 1
+        if completes == 1 then return nil, 400 end
+        return { id = "b_ok", path = payload.path }, nil
+    end
+    local _ok, _msg, stats = Upload.pushAll(api, store, function() return true end)
+    assert(state.presigns == 2, "expected a second presign, got " .. state.presigns)
+    assert(state.uploads == 2, "expected the bytes to be sent again, got " .. state.uploads)
+    assert(stats.sent == 1, "and it counts once, got " .. stats.sent)
+end)
+
+test("a presign that is refused sends no bytes", function()
+    -- The whole point of checking the path at presign: a doomed 30 MB upload
+    -- should be refused before it starts, not after.
+    local api, store, state = harness(2, 1024)
+    api.postJson = function(_s, path)
+        if path == "/library/upload/presign" then return nil, 409 end
+    end
+    local _ok, _msg, stats = Upload.pushAll(api, store, function() return true end)
+    assert(state.uploads == 0, "nothing should have been PUT, got " .. state.uploads)
+    assert(stats.skipped == 2, "409 is already-there, got skipped=" .. stats.skipped)
+end)
+
 test("the FOREGROUND run hands the request no callback", function()
     -- Belt and braces for the same thing, checked at the seam rather than by
     -- counting. The foreground's reporter is Trapper:info, which yields, and
     -- handing it to a request that runs inside a C call kills the run.
     local api, store, _state = harness(2, 1024)
     local saw_callback = false
-    api.uploadFile = function(_s, _p, _q, _lp, cb)
+    api.putFile = function(_s, _url, _lp, cb)
         if cb ~= nil then saw_callback = true end
-        return { id = "x", path = "/x" }, nil
+        return true
     end
     Upload.pushAll(api, store, function() return true end)
     assert(not saw_callback,
@@ -141,9 +203,9 @@ test("the BACKGROUND job does get one, because writing a file cannot yield", fun
     -- Without this the card sits still for the whole of a large book.
     local api, store, _state = harness(1, 4 * 1024 * 1024)
     local saw_callback = false
-    api.uploadFile = function(_s, _p, _q, _lp, cb)
+    api.putFile = function(_s, _url, _lp, cb)
         saw_callback = cb ~= nil
-        return { id = "x", path = "/x" }, nil
+        return true
     end
     Upload.pushAll(api, store, function() return true end, { on_book = function() end })
     assert(saw_callback, "the background job needs per-chunk progress")
@@ -157,10 +219,10 @@ test("bytes in flight are not counted twice when the book lands", function()
     local size = 4 * 1024 * 1024
     local api, store, _state = harness(1, size)
     local seen = {}
-    api.uploadFile = function(_s, _p, _q, _lp, cb)
+    api.putFile = function(_s, _url, _lp, cb)
         -- Report the whole file as sent, the way a real pump's last chunk does.
         if cb then cb(size) end
-        return { id = "x", path = "/x" }, nil
+        return true
     end
     Upload.pushAll(api, store, function() return true end, {
         on_book = function(u) seen[#seen + 1] = u end,
@@ -201,7 +263,12 @@ end)
 
 test("403 stops the run instead of asking 87 more times", function()
     local api, store, state = harness(5, 1024)
-    api.uploadFile = function() state.uploads = state.uploads + 1; return nil, 403 end
+    api.postJson = function(_s, path)
+        if path == "/library/upload/presign" then
+            state.uploads = state.uploads + 1
+            return nil, 403
+        end
+    end
     local ok, msg, stats = Upload.pushAll(api, store, function() return true end)
     assert(state.uploads == 1, "expected one refusal then a stop, got " .. state.uploads)
     assert(ok == false and stats.forbidden, "a 403 is a failure the reader must be told about")
@@ -209,7 +276,12 @@ end)
 
 test("409 is a skip, not a failure", function()
     local api, store, state = harness(3, 1024)
-    api.uploadFile = function() state.uploads = state.uploads + 1; return nil, 409 end
+    api.postJson = function(_s, path)
+        if path == "/library/upload/presign" then
+            state.uploads = state.uploads + 1
+            return nil, 409
+        end
+    end
     local _ok, _msg, stats = Upload.pushAll(api, store, function() return true end)
     assert(stats.skipped == 3 and stats.failed == 0,
         "409 means already there; got skipped=" .. stats.skipped .. " failed=" .. stats.failed)

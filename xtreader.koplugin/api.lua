@@ -366,4 +366,64 @@ function Api:uploadFile(path, query, local_path, progress_cb)
     return decodeJson(table.concat(sink)) or {}, nil
 end
 
+--- PUT a local file at a presigned URL. No Authorization header: the signature
+--- is in the query string, and adding a bearer token alongside it makes S3
+--- reject the request as doubly-authenticated.
+--
+-- Returns true, or nil plus the HTTP code / error string.
+--
+-- The URL is a capability with an expiry, so it is never logged. A signed URL
+-- in a log file is an upload slot anybody reading that file can use.
+function Api:putFile(url, local_path, progress_cb)
+    local lfs = require("libs/libkoreader-lfs")
+    local attr = lfs.attributes(local_path)
+    if not attr or attr.mode ~= "file" then
+        return nil, "not_a_file"
+    end
+    local handle, io_err = io.open(local_path, "rb")
+    if not handle then
+        return nil, io_err or "cannot_open"
+    end
+
+    local source = ltn12.source.file(handle)
+    if progress_cb then
+        local sent = 0
+        local inner = source
+        source = function()
+            local chunk, err = inner()
+            if chunk then
+                sent = sent + #chunk
+                progress_cb(sent)
+            end
+            return chunk, err
+        end
+    end
+
+    -- Same size-derived ceiling as before, and for the same reason: a fixed
+    -- total timeout is a question about the file's size pretending to be a
+    -- question about health.
+    local total_timeout = 60 + math.ceil(attr.size / (50 * 1024))
+    socketutil:set_timeout(30, total_timeout)
+    local code, _, status = socket.skip(1, http.request({
+        url     = url,
+        method  = "PUT",
+        headers = {
+            ["Content-Type"]   = "application/octet-stream",
+            ["Content-Length"] = tostring(attr.size),
+        },
+        source   = source,
+        sink     = ltn12.sink.null(),
+        redirect = false,
+    }))
+    socketutil:reset_timeout()
+    pcall(function() handle:close() end)
+
+    if code ~= 200 and code ~= 201 and code ~= 204 then
+        -- The path, never the URL.
+        logger.warn("xtreader: storage PUT failed:", status or code, local_path)
+        return nil, code
+    end
+    return true
+end
+
 return Api
