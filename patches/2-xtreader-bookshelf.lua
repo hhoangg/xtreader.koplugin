@@ -240,7 +240,12 @@ local function uploadCard()
         if rate then bits[#bits + 1] = T(_("%1 MB/s"), string.format("%.1f", rate / 1048576)) end
         local eta = humanEta(Job.eta(st))
         if eta then bits[#bits + 1] = eta end
-        local frac = (st.bytes_total or 0) > 0 and (st.bytes_done or 0) / st.bytes_total or nil
+        -- The bar counts BOOKS, not bytes, because the words beside it count
+        -- books. Bytes are the better guide to time and the worse guide to
+        -- this: the eight books that open a resumed run are 4.5 MB of 927, so
+        -- a byte bar sat at 0% next to the words "8 of 89" and read as broken.
+        -- The time estimate stays byte-based, where size is what matters.
+        local frac = (st.total or 0) > 0 and (st.done or 0) / st.total or nil
         return {
             title    = table.concat(bits, " \u{00B7} "),
             right    = frac and string.format("%d%%", math.floor(frac * 100)) or nil,
