@@ -426,4 +426,34 @@ function Api:putFile(url, local_path, progress_cb)
     return true
 end
 
+--- Move a book to a new account path. Returns true, or nil plus the code.
+--
+-- PATCH, which is what the browser already uses for this. Only `path` changes:
+-- the id and therefore the storage key are untouched, which is what lets
+-- another reader RENAME its local file instead of re-downloading several MB.
+--
+-- 405 is distinguished from 404 on purpose and the distinction is
+-- load-bearing. An unimplemented route under /library answers 405; a 404 means
+-- the ROW is gone -- tombstoned by another device or deleted in the browser --
+-- which is a real delete and must reach the delete path. Reading a
+-- not-yet-deployed endpoint as "this book no longer exists" would have every
+-- device quietly forget its library.
+function Api:movePath(id, new_path)
+    local body = JSON.encode({ path = new_path })
+    local sink = {}
+    local code = socket.skip(1, http.request({
+        url = self:baseUrl() .. "/library/" .. tostring(id),
+        method = "PATCH",
+        headers = self:authHeaders({
+            ["Content-Type"]   = "application/json",
+            ["Content-Length"] = tostring(#body),
+        }),
+        source = ltn12.source.string(body),
+        sink = ltn12.sink.table(sink),
+        redirect = false,
+    }))
+    if code == 200 or code == 204 then return true end
+    return nil, code
+end
+
 return Api

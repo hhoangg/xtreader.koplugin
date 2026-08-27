@@ -96,10 +96,62 @@ local function contentHash(path)
     return append()
 end
 
+--- Absolute paths under `root` whose basename is `name`.
+--
+-- Basename first, and only basename, because a move almost always keeps the
+-- filename -- dragging a book between folders in a file manager does not rename
+-- it. Searching by name narrows a library to a candidate or two, and hashing
+-- only those costs about a second each instead of hashing everything.
+--
+-- Depth-bounded for the same reason the upload scan is: 12 is far past any
+-- sane nesting and stops a symlink loop turning a sync into a hang.
+local function findByName(root, name, limit)
+    local out = {}
+    local function walk(dir, depth)
+        if depth > 12 or #out >= (limit or 4) then return end
+        local ok_iter, iter, obj = pcall(lfs.dir, dir)
+        if not ok_iter or type(iter) ~= "function" then return end
+        for entry in iter, obj do
+            if entry ~= "." and entry ~= ".." and entry:sub(1, 1) ~= "." then
+                local full = dir .. "/" .. entry
+                local attr = lfs.attributes(full)
+                if attr and attr.mode == "directory" then
+                    if not entry:match("%.sdr$") then walk(full, depth + 1) end
+                elseif attr and attr.mode == "file" and entry == name then
+                    out[#out + 1] = full
+                    if #out >= (limit or 4) then return end
+                end
+            end
+        end
+    end
+    walk(root, 1)
+    return out
+end
+
 local function localPathFor(root, server_path)
     -- `path` is already sanitised for FAT/exFAT server-side and always starts
     -- with a slash, so this is a join and not a rewrite.
     return root .. server_path
+end
+
+--- Where a book recorded at `server_path` has actually been moved to, or nil.
+--
+-- Returns a path only when the bytes match the manifest's contentHash, so a
+-- different book that happens to share a filename is never mistaken for the
+-- one that moved. Nil means "treat this as a delete", which is the safe
+-- direction to be wrong in: a missed move costs a placeholder the reader can
+-- tap, a false move would silently re-file somebody's library.
+local function findMovedTo(root, server_path, expect_hash)
+    if not expect_hash then return nil end
+    local name = server_path:match("[^/]+$")
+    if not name then return nil end
+    local old_full = localPathFor(root, server_path)
+    for _i, cand in ipairs(findByName(root, name, 4)) do
+        if cand ~= old_full and contentHash(cand) == expect_hash then
+            return cand
+        end
+    end
+    return nil
 end
 
 --- Runs a full library sync. Must be called inside a Trapper:wrap.
@@ -157,6 +209,42 @@ end
 -- Only ids whose file is ACTUALLY on disk are sent. The local index remembers
 -- what was downloaded, which is not the same as what is still there; a book
 -- deleted outside this plugin would otherwise be reported forever as held.
+--- Tell the account a book now lives somewhere else.
+--
+-- Returns true, or false plus a reason.
+--
+-- THE ENDPOINT IS NOT AGREED YET. This is the single place that changes when it
+-- is, which is why the move detection calls through here rather than building a
+-- request inline at the one site that needs it.
+--
+-- Until then it declines rather than guessing at a URL. Declining is not a
+-- degraded mode: the caller leaves the file exactly where the reader put it and
+-- retries next sync, so the only cost of the endpoint not existing yet is that
+-- the account keeps the old path -- which is what happens today anyway.
+--
+-- A 409 is NOT a failure to retry forever. It means a live book already holds
+-- the destination, so this reader has two books where the account has one, and
+-- no amount of retrying resolves that. Reported once and left alone.
+function Library.moveOnServer(api, id, new_path)
+    if type(api.movePath) ~= "function" then
+        return false, "no_endpoint"
+    end
+    local ok, code = api:movePath(id, new_path)
+    if ok then return true end
+    -- 405 is the route not existing yet, NOT the book. Kept apart from 404
+    -- deliberately: reading an undeployed endpoint as "this book is gone" would
+    -- have every device quietly forget its library.
+    if code == 405 or code == 501 then return false, "no_endpoint" end
+    -- 404 is the row: tombstoned by another device, or deleted in the browser.
+    -- That is a real delete and the caller must treat it as one.
+    if code == 404 then return false, "gone" end
+    -- 409 is a live book already holding the destination. Retrying cannot
+    -- change that, and it is not a local delete either -- the file on the card
+    -- is fine, the account just disagrees about where it belongs.
+    if code == 409 then return false, "path_taken" end
+    return false, tostring(code)
+end
+
 function Library.reportInventory(api, store)
     local lfs = require("libs/libkoreader-lfs")
     local root = store:get("library_dir")
@@ -222,6 +310,8 @@ function Library.sync(api, store, report)
     local renamed, downloaded, deleted, failed = 0, 0, 0, 0
     -- Books already on the card that the ledger had lost track of.
     local adopted = 0
+    -- Books the reader re-filed locally, propagated to the account.
+    local moved, move_failed = 0, 0
 
     -- Off by default. Pulling every book onto every reader is the wrong shape
     -- once an account outgrows the smallest card on it, and it is the behaviour
@@ -315,7 +405,53 @@ function Library.sync(api, store, report)
             -- Note it deliberately does not fire for a book that IS on disk with
             -- a stale hash: a changed file still gets re-fetched, because that
             -- is a different intent from having deleted it.
-            if known then
+            -- Before treating this as a delete: did it MOVE?
+            --
+            -- Dragging a book between folders leaves the ledger and the
+            -- manifest both pointing at the old path and nothing there, which
+            -- is byte-for-byte what a delete looks like from here. Reading it
+            -- as one produces two wrong things at once -- a placeholder at the
+            -- old path for a book he still has, and an orphaned file at the new
+            -- one that this plugin has no record of.
+            --
+            -- Only asked when the ledger knew about the book: a path that was
+            -- never held here cannot have been moved from it.
+            local moved_to = known and findMovedTo(root, entry.path, entry.contentHash)
+            if moved_to then
+                local new_rel = moved_to:sub(#root + 1)
+                local ok_move, move_err = Library.moveOnServer(api, id, new_rel)
+                if ok_move then
+                    known.path = new_rel
+                    known.move_conflict = nil
+                    store:setBook(id, known)
+                    moved = moved + 1
+                elseif move_err == "gone" then
+                    -- The account no longer has this book at all. That is a
+                    -- delete, arriving by a different route, and it gets the
+                    -- delete path rather than a retry.
+                    store:removeBook(id)
+                elseif move_err == "path_taken" then
+                    -- Remembered so it is attempted ONCE. A live book holds the
+                    -- destination, and asking again every sync forever cannot
+                    -- change that -- it only spends a request to be refused. If
+                    -- the reader moves the book somewhere else, the destination
+                    -- differs and it is tried again, which is the right trigger.
+                    if known.move_conflict ~= new_rel then
+                        known.move_conflict = new_rel
+                        store:setBook(id, known)
+                        move_failed = move_failed + 1
+                        logger.warn("xtreader: the account already has a book at:", new_rel)
+                    end
+                else
+                    -- Transport trouble, or the endpoint is not deployed. The
+                    -- file stays exactly where the reader put it and the next
+                    -- sync tries again -- the alternative is a ledger claiming
+                    -- a path the account does not have.
+                    logger.warn("xtreader: could not move on the server:",
+                                entry.path, "->", new_rel, tostring(move_err))
+                    if move_err ~= "no_endpoint" then move_failed = move_failed + 1 end
+                end
+            elseif known then
                 store:removeBook(id)
             end
         elseif on_disk and not known then
@@ -379,6 +515,14 @@ function Library.sync(api, store, report)
     -- events: one spent bandwidth and one recognised a file that was already
     -- here, and a reader watching a sync say "20 new" for books they can see
     -- were never downloaded has been told something untrue.
+    -- `moved` is the reader re-filing a book HERE and the account following;
+    -- `renamed` is the account re-filing one and this device following. Two
+    -- directions, and collapsing them would make a sync report unreadable in
+    -- exactly the case somebody is trying to work out which end moved what.
+    if moved > 0 or move_failed > 0 then
+        return true, T(_("Books: %1 new, %2 already here, %3 re-filed on the account, %4 could not be, %5 moved here, %6 removed, %7 failed."),
+                       downloaded, adopted, moved, move_failed, renamed, deleted, failed)
+    end
     if adopted > 0 then
         return true, T(_("Books: %1 new, %2 already here, %3 moved, %4 removed, %5 failed."),
                        downloaded, adopted, renamed, deleted, failed)
@@ -386,6 +530,10 @@ function Library.sync(api, store, report)
     return true, T(_("Books: %1 new, %2 moved, %3 removed, %4 failed."),
                    downloaded, renamed, deleted, failed)
 end
+
+-- Exported for the move tests: deciding a move from a delete is the one piece
+-- of guesswork in this file, and it is testable without a device.
+Library.findMovedTo = findMovedTo
 
 Library.sidecarDir = sidecarDir
 Library.ensureDir = ensureDir
