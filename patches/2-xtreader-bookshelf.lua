@@ -29,7 +29,6 @@ sees the same books in both.
 local logger = require("logger")
 local userpatch = require("userpatch")
 local _ = require("gettext")
-local T = require("ffi/util").template
 
 --- The live xtreader plugin instance, or nil.
 --
@@ -151,7 +150,12 @@ end
 --
 -- `done(path)` on success, `done(nil, message)` on failure. Called exactly
 -- once; kindleui guards against a second call, but this does not rely on that.
-local function opener(book, done)
+--
+-- `progress(fraction)` reports 0..1 as bytes arrive. Nothing is put on screen
+-- here: kindleui draws the figure as a pill on the book's own card, and a
+-- message of our own would be a second indicator for one download, covering
+-- the shelf to say what the card already says.
+local function opener(book, done, progress)
     local inst = plugin()
     if not (inst and inst.api and inst.store) then
         return done(nil, _("xtreader is not available."))
@@ -173,16 +177,25 @@ local function opener(book, done)
     NetworkMgr:runWhenOnline(function()
         local Trapper = require("ui/trapper")
         Trapper:wrap(function()
-            Trapper:info(T(_("Downloading:\n%1"), book.title or entry.path))
             local dir = target:match("^(.*)/[^/]+$")
             if dir then
                 -- This book's place in the account's tree has no reason to
                 -- exist here yet.
                 os.execute(string.format("mkdir -p '%s'", dir:gsub("'", "'\\''")))
             end
+            -- socketutil's progress sink reports BYTES SO FAR; the fraction is
+            -- ours to compute, and only when the size is known -- a manifest
+            -- entry without one would divide by zero and paint "inf%".
+            local total = tonumber(entry.size) or 0
+            local progress_cb
+            if progress and total > 0 then
+                progress_cb = function(sofar)
+                    local n = tonumber(sofar)
+                    if n then progress(n / total) end
+                end
+            end
             local ok_dl, err = inst.api:downloadTo("/library/" .. id .. "/file",
-                                                   target, entry.size)
-            Trapper:clear()
+                                                   target, entry.size, progress_cb)
             if not ok_dl then
                 return done(nil, tostring(err))
             end
