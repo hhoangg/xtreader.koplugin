@@ -2,17 +2,27 @@
 The bulk upload as a background job: fork it, poll it, show it in the control
 centre, let the reader carry on reading.
 
-WHY A SUBPROCESS AND NOT A COROUTINE
+WHY A SEPARATE PROGRAM AND NOT A COROUTINE, AND NOT A FORK EITHER
 
-Because a coroutine cannot help. `http.request` is a blocking C call, and Lua
-cannot yield across a C boundary -- an earlier attempt to report progress from
-inside the request died with exactly that error and took the whole run with it.
-So while a book is in flight the Lua VM is stuck, full stop. The only way the
-reader keeps reading is if the upload is not in this process at all.
+A coroutine cannot help: `http.request` is a blocking C call and Lua cannot
+yield across a C boundary, so while a book is in flight the VM is stuck. The
+reader only keeps reading if the upload is not in this process.
 
-`ffiutil.runInSubProcess` forks. The child gets a copy of everything, including
-the API object and its token, does the whole upload, and never touches the UI.
-The parent polls, paints, and turns pages.
+The first attempt used `ffiutil.runInSubProcess`, which forks KOReader. On the
+device that got the reader killed outright:
+
+    Out of memory: Kill process 14854 (reader.lua) score 982
+    Killed process 14854 (reader.lua) total-vm:354512kB anon-rss:210884kB
+
+A Paperwhite 5 has 485 MB, and about 116 MB free with KOReader up. Forking a
+210 MB process into that is not something copy-on-write rescues -- the child
+runs a Lua GC and an SSL stack, so it touches pages, and a touched page is a
+copied page. The owner read it as a weak chip. It was not; it was arithmetic.
+
+So the upload runs as its own program, `upload_worker.lua`, under the same
+luajit with only LuaSocket and LuaSec loaded. Measured on the device: **3.3 MB**
+against 210. It needs a token, a URL and a list of files; it does not need a
+widget tree, a font stack or a document engine.
 
 WHY A FILE AND NOT THE PIPE
 
@@ -49,7 +59,6 @@ them from the manifest instead. Slower, not wrong.
 
 local DataStorage = require("datastorage")
 local UIManager = require("ui/uimanager")
-local ffiutil = require("ffi/util")
 local logger = require("logger")
 local _ = require("gettext")
 
@@ -224,6 +233,30 @@ function Job.isActive()
     return job ~= nil and job.st ~= nil and job.st.phase == "running"
 end
 
+--- The worker's pid, read from the file the spawning shell wrote.
+function Job.pid()
+    if not job or not job.pid_file then return nil end
+    if job.pid then return job.pid end
+    local f = io.open(job.pid_file, "r")
+    if not f then return nil end
+    local n = tonumber((f:read("*l") or ""):match("%d+") or "")
+    f:close()
+    job.pid = n
+    return n
+end
+
+--- True while the worker process is alive.
+--
+-- /proc rather than a signal: this is a sibling process, not a child, so
+-- waitpid tells us nothing about it and kill(0) would need the same privileges
+-- anyway. A directory that exists is the whole test.
+local function workerAlive()
+    local pid = Job.pid()
+    if not pid then return false end
+    local lfs = require("libs/libkoreader-lfs")
+    return lfs.attributes("/proc/" .. pid, "mode") == "directory"
+end
+
 --- Forget a finished job's card. Refuses while one is running -- that is
 --- `cancel`, and the two must not be one tap apart.
 function Job.dismiss()
@@ -236,20 +269,18 @@ end
 --- Stop a running job.
 function Job.cancel()
     if not job then return false end
-    if job.pid then
-        ffiutil.terminateSubProcess(job.pid)
-        -- Collect it later so it does not linger as a zombie. Rescheduled
-        -- rather than waited on: the child may be mid-request and take a moment
-        -- to die, and the UI must not block on that.
-        local pid = job.pid
-        local collect
-        collect = function()
-            if not ffiutil.isSubProcessDone(pid) then
-                UIManager:scheduleIn(5, collect)
-            end
-        end
-        UIManager:scheduleIn(2, collect)
+    local pid = Job.pid()
+    if pid then
+        -- TERM, not KILL. The worker has no cleanup to do beyond letting the
+        -- current request end, and a signal it can decline is one a wedged
+        -- process ignores -- so TERM first is politeness with a fallback, and
+        -- the fallback is that the process is a sibling nobody has to reap.
+        os.execute("kill -TERM " .. pid .. " 2>/dev/null")
+        UIManager:scheduleIn(3, function()
+            os.execute("kill -KILL " .. pid .. " 2>/dev/null")
+        end)
     end
+    if job.job_file then os.remove(job.job_file) end
     if job.poll then UIManager:unschedule(job.poll) end
     -- Commit whatever it managed before it was stopped, so those books are not
     -- downloaded back on the next sync.
@@ -277,6 +308,24 @@ function Job._commit()
     return n
 end
 
+--- Everything the worker needs, written where only it will look.
+--
+-- Line based for the same reason the state file is, and NOT passed on the
+-- command line: it carries the account token, and an argument is visible to
+-- anything that can run `ps`.
+local function writeJobFile(path, fields, books)
+    local f = io.open(path, "w")
+    if not f then return false end
+    for k, v in pairs(fields) do
+        f:write(k, "=", tostring(v), "\n")
+    end
+    for _i, b in ipairs(books) do
+        f:write("file=", b.path, "\t", b.rel, "\t", tostring(b.size or 0), "\n")
+    end
+    f:close()
+    return true
+end
+
 --- Start the job. Returns true, or false plus a reason.
 function Job.start(api, store, Upload)
     if job and Job.isActive() then
@@ -302,28 +351,33 @@ function Job.start(api, store, Upload)
     for _i, b in ipairs(books) do seed.bytes_total = seed.bytes_total + (b.size or 0) end
     writeState(seed)
 
-    -- The child. It must not touch UIManager or any widget: it shares their
-    -- memory but not their screen, and a repaint from here would be drawn by a
-    -- process that does not own the framebuffer.
-    local pid = ffiutil.runInSubProcess(function()
-        local ok, err = pcall(function()
-            Upload.pushAll(api, store, function() return true end, {
-                books = books,
-                on_book = function(update) writeState(update) end,
-            })
-        end)
-        if not ok then
-            local st = readState() or seed
-            st.phase = "failed"
-            st.message = tostring(err)
-            writeState(st)
-        end
-    end)
-    if not pid then
-        return false, _("Could not start the upload.")
+    local ko_dir = DataStorage:getDataDir()
+    local job_file = ko_dir .. "/cache/xtreader-upload.job"
+    local pid_file = ko_dir .. "/cache/xtreader-upload.pid"
+    os.remove(pid_file)
+    if not writeJobFile(job_file, {
+            base_url = store:get("base_url"),
+            token    = store:get("access_token"),
+            state    = statePath(),
+        }, books) then
+        return false, _("Could not prepare the upload.")
     end
 
-    job = { pid = pid, store = store, st = seed }
+    -- Spawned detached, with its own pid recorded so it can be stopped later.
+    -- `os.execute` blocks until the command returns, so the whole thing is
+    -- backgrounded in the shell and the shell exits immediately.
+    --
+    -- Output goes to a log rather than to the terminal KOReader does not have.
+    local cmd = string.format(
+        "cd %q && (LD_LIBRARY_PATH=%q ./luajit %q %q >/dev/null 2>&1 & echo $! > %q) &",
+        ko_dir, ko_dir .. "/libs",
+        ko_dir .. "/plugins/xtreader.koplugin/upload_worker.lua",
+        job_file, pid_file)
+    os.execute(cmd)
+
+    job = { store = store, st = seed, pid_file = pid_file, job_file = job_file }
+    -- The pid appears a moment after the shell forks, so it is read lazily
+    -- rather than here; Job.pid() picks it up on the first poll.
 
     -- Poll. Cheap, and the only thing standing between the child and a card
     -- that never updates.
@@ -343,11 +397,15 @@ function Job.start(api, store, Upload)
         local ok, err = pcall(function()
             local st = readState()
             if st then job.st = st end
-            if ffiutil.isSubProcessDone(pid) then
-                job.pid = nil
+            -- Alive is decided from /proc, and only once the pid file has
+            -- appeared: between the spawn and the shell writing it there is a
+            -- moment where the worker is running and unidentifiable, and
+            -- treating that as "finished" would end the job at birth.
+            if Job.pid() and not workerAlive() then
                 local committed = Job._commit()
                 job.st = job.st or {}
                 if job.st.phase == "running" then job.st.phase = "done" end
+                if job.job_file then os.remove(job.job_file) end
                 logger.dbg("xtreader: upload job finished, committed", committed, "books")
                 return true   -- finished: do not reschedule
             end
