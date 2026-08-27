@@ -337,14 +337,18 @@ function Upload.pushAll(api, store, report, opts)
     local started_at = os.time()
     local accepted = {}
 
-    local function announce(current)
+    -- `in_flight` is bytes of the CURRENT book that have gone out but are not
+    -- yet counted in the totals -- the book has not finished, so committing
+    -- them would double-count when it does.
+    local function announce(current, in_flight)
         if not opts.on_book then return end
+        local flight = tonumber(in_flight) or 0
         opts.on_book({
             phase = "running", total = #books, done = stats.sent + stats.skipped
                    + stats.conflict + stats.failed + stats.too_big,
             sent = stats.sent, skipped = stats.skipped, conflict = stats.conflict,
             failed = stats.failed, too_big = stats.too_big,
-            bytes_done = bytes_done, bytes_sent = bytes_sent,
+            bytes_done = bytes_done + flight, bytes_sent = bytes_sent + flight,
             bytes_total = bytes_total,
             started_at = started_at, current = current or "",
             books = accepted,
@@ -395,31 +399,41 @@ function Upload.pushAll(api, store, report, opts)
                 else
                     local query = "path=" .. Upload.escape(b.rel)
                                   .. "&contentHash=" .. Upload.escape(hash)
-                    -- NO PROGRESS CALLBACK, AND IT CANNOT HAVE ONE.
+                    -- Per-chunk progress, but ONLY in the background job.
                     --
-                    -- A previous version reported progress from inside the
-                    -- upload's own byte pump, to give the coroutine a yield
-                    -- point per chunk so the pause dialog could be drawn while
-                    -- a book was in flight. It cannot work: `report` is
-                    -- Trapper:info, which YIELDS, and the pump is driven from
-                    -- inside LuaSocket's `http.request` -- a C function. Lua
-                    -- cannot yield across a C call boundary, so the first
-                    -- upload died with exactly that error and took the whole
-                    -- run with it.
+                    -- This is the same callback that was fatal in the
+                    -- foreground, and the difference is what it does rather
+                    -- than where it is called from. `report` is Trapper:info,
+                    -- which YIELDS, and the pump runs inside LuaSocket's
+                    -- `http.request` -- a C function Lua cannot yield across.
+                    -- `on_book` writes a file. A write does not yield, so the
+                    -- C frame in between is nothing to it.
                     --
-                    -- The unit test did not catch it, and could not have as
-                    -- written: it drove the callback from Lua, so the yield had
-                    -- no C frame to cross. A test that calls your callback from
-                    -- a friendlier place than production does is a test that
-                    -- can only confirm what you already believe.
+                    -- Which is why it is gated on on_book and not offered to
+                    -- the foreground path: the foreground's reporter is the one
+                    -- that yields, and handing it to the request would kill the
+                    -- run exactly as it did before.
                     --
-                    -- So the honest position: a blocking LuaSocket request
-                    -- cannot be interrupted from Lua, and an abort takes effect
-                    -- BETWEEN books. At ~2 MB/s that is a few seconds for a
-                    -- typical book and under a minute for the largest the
-                    -- server accepts. The progress line above says which book
-                    -- and how big it is, so the wait is at least explained.
-                    local entry, up_code = api:uploadFile("/library/upload", query, b.path)
+                    -- Without this the card sits still for the whole of a large
+                    -- book -- fifteen seconds and more at Kindle speeds -- and
+                    -- a progress bar that does not move is one nobody believes.
+                    local up_progress
+                    if opts.on_book then
+                        -- Every 512 KB rather than every chunk: each tick
+                        -- rewrites the state file, and at 8 KB chunks that
+                        -- would be hundreds of writes per book to move a bar
+                        -- by a pixel. 512 KB is a quarter-second of transfer,
+                        -- comfortably finer than the parent's one-second poll.
+                        local step = 512 * 1024
+                        local next_at = step
+                        up_progress = function(sofar)
+                            if sofar < next_at then return end
+                            next_at = sofar + step
+                            announce(b.rel, sofar)
+                        end
+                    end
+                    local entry, up_code = api:uploadFile("/library/upload", query,
+                                                          b.path, up_progress)
                     if entry then
                         stats.sent = stats.sent + 1
                         bytes_done = bytes_done + (b.size or 0)

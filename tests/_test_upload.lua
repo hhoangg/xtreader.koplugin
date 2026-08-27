@@ -120,10 +120,10 @@ test("nothing is reported from inside the upload", function()
         .. state.reports)
 end)
 
-test("uploadFile is called without a progress callback", function()
+test("the FOREGROUND run hands the request no callback", function()
     -- Belt and braces for the same thing, checked at the seam rather than by
-    -- counting: whatever the loop does, it must not hand the request a
-    -- function to call.
+    -- counting. The foreground's reporter is Trapper:info, which yields, and
+    -- handing it to a request that runs inside a C call kills the run.
     local api, store, _state = harness(2, 1024)
     local saw_callback = false
     api.uploadFile = function(_s, _p, _q, _lp, cb)
@@ -133,6 +133,44 @@ test("uploadFile is called without a progress callback", function()
     Upload.pushAll(api, store, function() return true end)
     assert(not saw_callback,
         "a progress callback here yields across a C boundary and kills the run")
+end)
+
+test("the BACKGROUND job does get one, because writing a file cannot yield", function()
+    -- Same callback position, different thing being called. on_book writes to
+    -- disk; a write does not yield, so the C frame in between is nothing to it.
+    -- Without this the card sits still for the whole of a large book.
+    local api, store, _state = harness(1, 4 * 1024 * 1024)
+    local saw_callback = false
+    api.uploadFile = function(_s, _p, _q, _lp, cb)
+        saw_callback = cb ~= nil
+        return { id = "x", path = "/x" }, nil
+    end
+    Upload.pushAll(api, store, function() return true end, { on_book = function() end })
+    assert(saw_callback, "the background job needs per-chunk progress")
+end)
+
+test("bytes in flight are not counted twice when the book lands", function()
+    -- The partial figure is added to the totals for display only. Committing it
+    -- would double-count the moment the book finishes and its full size is
+    -- added properly -- and a bar that overshoots 100% is a bar nobody trusts
+    -- for the rest of the run.
+    local size = 4 * 1024 * 1024
+    local api, store, _state = harness(1, size)
+    local seen = {}
+    api.uploadFile = function(_s, _p, _q, _lp, cb)
+        -- Report the whole file as sent, the way a real pump's last chunk does.
+        if cb then cb(size) end
+        return { id = "x", path = "/x" }, nil
+    end
+    Upload.pushAll(api, store, function() return true end, {
+        on_book = function(u) seen[#seen + 1] = u end,
+    })
+    local last = seen[#seen]
+    assert(last.bytes_sent == size,
+        "expected exactly one file's worth, got " .. tostring(last.bytes_sent)
+        .. " for a " .. size .. " byte book")
+    assert(last.bytes_done <= last.bytes_total,
+        "progress must never exceed the total")
 end)
 
 test("stopping between books stops before the next upload", function()
