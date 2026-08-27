@@ -297,6 +297,19 @@ userpatch.registerPatchPluginFunc("kindleui", function()
     Placeholders.setProvider(provider)
     Placeholders.setOpener(opener)
 
+    -- Moves made from the SHELF. bookshelf renames with os.rename, so
+    -- FileManager:moveFile is never called and 2-xtreader-move.lua -- which
+    -- patches exactly that -- never fires for them. That patch still covers
+    -- KOReader's own file browser; this covers the screen he actually uses.
+    if type(Placeholders.setMoveObserver) == "function" then
+        Placeholders.setMoveObserver(function(from_abs, to_abs)
+            local inst = plugin()
+            if not (inst and inst.store and inst.store:isPaired()) then return end
+            local Library = require("library")
+            Library.noteLocalMove(inst.store, from_abs, to_abs)
+        end)
+    end
+
     -- The upload card in the control centre. Optional on a kindleui without it,
     -- for the same reason the folder provider is: this patch has to keep
     -- working against a build that has one registry and not the other.
