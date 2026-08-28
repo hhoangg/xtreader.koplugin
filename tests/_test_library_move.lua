@@ -190,6 +190,77 @@ test("it does NOT move library.path, which would undo the move next sync", funct
         "the push has to be remembered somewhere, got " .. tostring(st._books.b1.pending_move))
 end)
 
+test("a SECOND move before any sync is still found", function()
+    -- Reported from the device: /A -> /B worked, /B -> /A left a placeholder in
+    -- /B until a sync.
+    --
+    -- After the first note, library.path still says /test -- deliberately, it
+    -- is the SERVER's view -- while the file really sits in /Tien hiep. Matching
+    -- the move's source against library.path alone therefore finds nothing the
+    -- second time, and the catalogue is left pointing at a folder the book left.
+    local st = fakeStore({ b1 = { path = "/test/x.epub" } },
+                         { b1 = { path = "/test/x.epub" } })
+    Library.noteLocalMove(st, "/lib/test/x.epub", "/lib/Tien hiep/x.epub")
+    local id = Library.noteLocalMove(st, "/lib/Tien hiep/x.epub", "/lib/Kiem hiep/x.epub")
+    assert(id == "b1", "the book has to be found by where it IS, got " .. tostring(id))
+    assert(st._cat.b1.path == "/Kiem hiep/x.epub",
+        "the catalogue must follow the second move too, got " .. tostring(st._cat.b1.path))
+    assert(st._books.b1.pending_move == "/Kiem hiep/x.epub",
+        "the push must name the latest path, got " .. tostring(st._books.b1.pending_move))
+    assert(st._books.b1.path == "/test/x.epub",
+        "library.path is still the server's view, got " .. tostring(st._books.b1.path))
+end)
+
+test("moving a book BACK to where the server has it cancels the push", function()
+    -- The end state is the one the server already believes, so there is nothing
+    -- left to tell it. A pending_move here would be a no-op round trip, and a
+    -- catalogue still naming the middle folder is the placeholder bug itself.
+    local st = fakeStore({ b1 = { path = "/test/x.epub" } },
+                         { b1 = { path = "/test/x.epub" } })
+    Library.noteLocalMove(st, "/lib/test/x.epub", "/lib/Tien hiep/x.epub")
+    local id = Library.noteLocalMove(st, "/lib/Tien hiep/x.epub", "/lib/test/x.epub")
+    assert(id == "b1", "expected the book id, got " .. tostring(id))
+    assert(st._cat.b1.path == "/test/x.epub",
+        "the catalogue must come back with it, got " .. tostring(st._cat.b1.path))
+    assert(st._books.b1.pending_move == nil,
+        "nothing to push, got " .. tostring(st._books.b1.pending_move))
+end)
+
+test("a STALE pending_move must not hide a move from the server's own path", function()
+    -- pending_move is a hint, not a fact: pass 1 of the sync clears it whenever
+    -- the file is not where it says. A sync that rewrites the catalogue from a
+    -- fresh manifest can leave the hint behind pointing at a folder the book is
+    -- not in.
+    --
+    -- Matching ONLY on `pending_move or path` let that stale hint shadow
+    -- library.path, so a perfectly ordinary first move -- out of the folder the
+    -- server names -- matched nothing and the catalogue kept the old folder.
+    -- That is the placeholder-in-the-source-folder bug, reintroduced from the
+    -- other side.
+    local st = fakeStore({ b1 = { path = "/tieu thuyet/x.epub",
+                                  pending_move = "/somewhere else/x.epub" } },
+                         { b1 = { path = "/tieu thuyet/x.epub" } })
+    local id = Library.noteLocalMove(st, "/lib/tieu thuyet/x.epub", "/lib/test/x.epub")
+    assert(id == "b1", "the server's own path must still match, got " .. tostring(id))
+    assert(st._cat.b1.path == "/test/x.epub",
+        "the catalogue must follow, got " .. tostring(st._cat.b1.path))
+    assert(st._books.b1.pending_move == "/test/x.epub",
+        "the stale hint must be replaced, got " .. tostring(st._books.b1.pending_move))
+end)
+
+test("the book actually AT the source wins over one the server merely names there", function()
+    -- Two books can name the same path from different sides: b1 left it (the
+    -- server has not been told yet), b2 was moved into it. The one that is
+    -- really there is the one being moved.
+    local st = fakeStore({
+        b1 = { path = "/A/x.epub", pending_move = "/B/x.epub" },
+        b2 = { path = "/C/x.epub", pending_move = "/A/x.epub" },
+    }, { b1 = { path = "/B/x.epub" }, b2 = { path = "/A/x.epub" } })
+    local id = Library.noteLocalMove(st, "/lib/A/x.epub", "/lib/D/x.epub")
+    assert(id == "b2", "expected the book that is at /A, got " .. tostring(id))
+    assert(st._books.b1.pending_move == "/B/x.epub", "b1 must not be touched")
+end)
+
 test("a file the account does not know about is ignored", function()
     local st = fakeStore({ b1 = { path = "/test/x.epub" } }, { b1 = {} })
     assert(Library.noteLocalMove(st, "/lib/other/z.epub", "/lib/Tien hiep/z.epub") == nil)

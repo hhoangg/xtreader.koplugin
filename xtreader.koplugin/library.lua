@@ -264,6 +264,27 @@ end
 -- and pass 1 renames the local file whenever the two disagree -- so writing the
 -- new path there would have the next sync move the book back.
 --
+-- WHICH BOOK THIS IS
+--
+-- Two passes, because the book's real location can be recorded in either field
+-- and NEITHER is reliable alone.
+--
+-- Matching on `library.path` alone worked exactly once per book: it is the
+-- SERVER's view, so after one un-synced move it names a folder the book has
+-- left, and a second move -- most obviously moving it straight back -- found
+-- nothing. The catalogue kept the middle folder and drew a placeholder there
+-- for a book that was not missing.
+--
+-- Matching on `pending_move or library.path` alone is wrong in the other
+-- direction. `pending_move` is a HINT, not a fact: pass 1 of the sync clears it
+-- whenever the file is not where it says, precisely because it goes stale. A
+-- stale hint would shadow `library.path` and make an ordinary first move -- out
+-- of the folder the server names -- match nothing, which is the same
+-- placeholder bug entering from the other side.
+--
+-- So: prefer the book whose EFFECTIVE location is the source, since that is the
+-- one actually sitting there; fall back to the server's own path.
+--
 -- Returns the book id, or nil when this was not a book the account knows.
 function Library.noteLocalMove(store, from_abs, to_abs)
     local root = store:get("library_dir")
@@ -278,20 +299,35 @@ function Library.noteLocalMove(store, from_abs, to_abs)
     local to_rel   = to_abs:sub(#root + 1)
     if from_rel == to_rel then return nil end
 
-    for id, known in store:eachBook() do
-        if known.path == from_rel then
-            known.pending_move = to_rel
-            store:setBook(id, known)
-            local cat = store:getCatalogueEntry(id)
-            if cat then
-                cat.path = to_rel
-                store:setCatalogueEntry(id, cat)
-            end
-            store:flush()
-            return id
+    local target, known
+    for id, entry in store:eachBook() do
+        if (entry.pending_move or entry.path) == from_rel then
+            target, known = id, entry
+            break
         end
     end
-    return nil
+    if not target then
+        for id, entry in store:eachBook() do
+            if entry.path == from_rel then
+                target, known = id, entry
+                break
+            end
+        end
+    end
+    if not target then return nil end
+
+    -- Back where the server already has it: nothing is left to tell the server,
+    -- so the note is dropped rather than kept as a round trip that would move
+    -- the book to where it already is.
+    known.pending_move = (to_rel ~= known.path) and to_rel or nil
+    store:setBook(target, known)
+    local cat = store:getCatalogueEntry(target)
+    if cat then
+        cat.path = to_rel
+        store:setCatalogueEntry(target, cat)
+    end
+    store:flush()
+    return target
 end
 
 function Library.reportInventory(api, store)
