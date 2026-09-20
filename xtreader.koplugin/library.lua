@@ -652,5 +652,8 @@ Library.findMovedTo = findMovedTo
 
 Library.sidecarDir = sidecarDir
 Library.ensureDir = ensureDir
+-- Shared with font sync, which needs the same hash and the same tree removal.
+Library.contentHash = contentHash
+Library.removeTree = removeTree
 
 return Library

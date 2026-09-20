@@ -43,6 +43,10 @@ Store.DEFAULTS = {
     -- Wallpapers land here and nowhere else; see wallpaper.lua for why the
     -- folder must stay flat.
     wallpaper_dir = "/mnt/us/koreader/xtreader_wallpapers",
+    -- Fonts land here and nowhere else. KOReader scans `/mnt/us/fonts`
+    -- recursively, and this plugin owns this one subfolder outright; see
+    -- fonts.lua.
+    font_dir = "/mnt/us/fonts/xtreader",
     last_library_sync = 0,
     last_wallpaper_sync = 0,
 }
@@ -70,6 +74,10 @@ function Store:open()
     -- with a way to fetch it -- and the only place that fact can live between
     -- syncs is here.
     self.catalogue = self.obj:readSetting("catalogue", {})
+    -- What font sync put in `font_dir`, keyed by "<family>/<fileName>":
+    -- `{ id, hash, size }`. It only ever decides re-downloads; what gets deleted
+    -- is decided by the manifest, never by this.
+    self.fonts = self.obj:readSetting("fonts", {})
     for k, v in pairs(Store.DEFAULTS) do
         if self.data[k] == nil then
             self.data[k] = v
@@ -164,6 +172,25 @@ function Store:eachCatalogueEntry()
     return pairs(self.catalogue)
 end
 
+--- The recorded state of one synced font file, by its path under font_dir.
+function Store:getFont(rel)
+    return self.fonts[rel]
+end
+
+function Store:setFont(rel, entry)
+    self.fonts[rel] = entry
+    self.dirty = true
+end
+
+function Store:removeFont(rel)
+    self.fonts[rel] = nil
+    self.dirty = true
+end
+
+function Store:eachFont()
+    return pairs(self.fonts)
+end
+
 function Store:flush()
     if not self.obj then
         return
@@ -171,6 +198,7 @@ function Store:flush()
     self.obj:saveSetting("config", self.data)
     self.obj:saveSetting("library", self.library)
     self.obj:saveSetting("catalogue", self.catalogue)
+    self.obj:saveSetting("fonts", self.fonts)
     self.obj:flush()
     self.dirty = nil
 end

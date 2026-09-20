@@ -14,6 +14,11 @@ The response carries `wallpaperRevision`, an opaque fingerprint of the wallpaper
 set currently assigned to this device. It is compared for equality and nothing
 else: never ordered, never parsed, never assumed to increase. A real revision is
 never 0, which leaves 0 free as "unknown" and inert in both directions.
+
+It also carries `fontsRevision`, which is a different kind of number: a
+per-account counter the server bumps on every change to the font set. Fonts
+have no periodic fallback resync, so a fingerprint collision there would lose
+an update for good; a monotonic counter cannot collide with its own past.
 ]]
 
 local Device = require("device")
@@ -73,7 +78,8 @@ local function diskBytes(path)
     return tonumber(total_k) * 1024, tonumber(avail_k) * 1024
 end
 
---- Sends one heartbeat. Returns the server's `wallpaperRevision`, or nil.
+--- Sends one heartbeat. Returns the server's `wallpaperRevision` (nil when
+--- absent or 0) and its `fontsRevision` (nil when absent), independently.
 function Heartbeat.send(api, store, last_sync_status)
     if not store:isPaired() then
         return nil
@@ -94,11 +100,13 @@ function Heartbeat.send(api, store, last_sync_status)
         return nil
     end
 
+    -- Read separately: a server with no wallpapers to report must not hide a
+    -- font change behind an early return.
     local revision = tonumber(body.wallpaperRevision)
-    if revision == nil or revision == 0 then
-        return nil
+    if revision == 0 then
+        revision = nil
     end
-    return revision
+    return revision, tonumber(body.fontsRevision)
 end
 
 --- True when the wallpaper set changed since the sync we last ran.
@@ -113,6 +121,17 @@ function Heartbeat.wallpapersChanged(store, revision)
         return true
     end
     return seen ~= revision
+end
+
+--- True when the font set changed since the last font sync that succeeded.
+-- A counter rather than a fingerprint, so 0 is a real value here: an account
+-- that has never had a font is at 0, and a device that has never synced one
+-- reads as 0 too, which is correctly "nothing to do".
+function Heartbeat.fontsChanged(store, revision)
+    if revision == nil then
+        return false
+    end
+    return (store:get("fonts_revision") or 0) ~= revision
 end
 
 return Heartbeat

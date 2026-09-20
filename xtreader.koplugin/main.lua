@@ -29,6 +29,7 @@ local _ = require("gettext")
 local T = require("ffi/util").template
 
 local Api = require("api")
+local Fonts = require("fonts")
 local Heartbeat = require("heartbeat")
 local Insights = require("insights")
 local KindleHistory = require("kindle_history")
@@ -182,6 +183,14 @@ function Xtreader:runSync(fn, opts)
             end
             Trapper:clear()
             notify(message or (ok and _("Done.") or _("Failed.")), ok and 5 or 10)
+            -- crengine registers fonts only at startup, so a font sync that
+            -- changed anything does nothing visible until KOReader restarts.
+            -- Asked after the summary rather than instead of it: the reader
+            -- still needs to see what the sync did, including what failed.
+            if self.fonts_need_restart then
+                self.fonts_need_restart = nil
+                UIManager:askForRestart(_("Fonts changed. Restart KOReader to use them?"))
+            end
         end)
     end)
 end
@@ -222,7 +231,7 @@ function Xtreader:syncAll(report)
     -- The heartbeat rides a request we owe the server anyway, and its reply
     -- says whether the wallpaper set moved. Comparing the fingerprint saves a
     -- manifest round trip on the common no-change run.
-    local revision = Heartbeat.send(self.api, self.store, ok_books and "ok" or "failed")
+    local revision, fonts_revision = Heartbeat.send(self.api, self.store, ok_books and "ok" or "failed")
     if Heartbeat.wallpapersChanged(self.store, revision) then
         local ok_wp, wp_msg = Wallpaper.sync(self.api, self.store, report)
         lines[#lines + 1] = wp_msg
@@ -234,6 +243,22 @@ function Xtreader:syncAll(report)
         end
     else
         lines[#lines + 1] = _("Wallpapers already up to date.")
+    end
+
+    -- Fonts follow the same gate, on a counter instead of a fingerprint.
+    -- Fonts.sync is only ok when its manifest carried this very revision, so
+    -- storing it cannot mark the device current against a set it never saw.
+    if Heartbeat.fontsChanged(self.store, fonts_revision) then
+        local ok_fonts, fonts_msg, fonts_changed = Fonts.sync(self.api, self.store, fonts_revision, report)
+        lines[#lines + 1] = fonts_msg
+        if ok_fonts then
+            self.store:set("fonts_revision", fonts_revision)
+        end
+        if fonts_changed then
+            self.fonts_need_restart = true
+        end
+    else
+        lines[#lines + 1] = _("Fonts already up to date.")
     end
 
     self.store:flush()

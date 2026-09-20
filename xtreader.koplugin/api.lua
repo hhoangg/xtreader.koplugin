@@ -168,11 +168,19 @@ end
 -- they are never synthesised or cached across a query change.
 --
 -- `on_entry` is called per entry so a caller can filter without a second pass.
+--
+-- The fourth return is the trailers' `revision`, and only when EVERY page
+-- carried the same number. A walk whose pages disagree straddled a change on
+-- the server, so it describes no single version of the set, and a caller
+-- deciding what to delete must not be handed one as if it did. Manifests that
+-- carry no revision at all simply yield nil.
 function Api:fetchManifest(path, query, on_entry)
     local entries = {}
     local cursor = nil
     local total = nil
     local pages = 0
+    local revision = nil
+    local revision_ok = true
 
     repeat
         local url = self:baseUrl() .. path .. "?" .. (query or "")
@@ -208,6 +216,11 @@ function Api:fetchManifest(path, query, on_entry)
         cursor = trailer.nextCursor
         total = trailer.totalCount
         pages = pages + 1
+        if type(trailer.revision) ~= "number"
+            or (revision ~= nil and trailer.revision ~= revision) then
+            revision_ok = false
+        end
+        revision = revision or trailer.revision
 
         -- A runaway-paging backstop, but it must never look like a completed
         -- walk. Callers use the returned set to decide what to DELETE, so
@@ -220,7 +233,7 @@ function Api:fetchManifest(path, query, on_entry)
         end
     until cursor == nil
 
-    return entries, 200, total
+    return entries, 200, total, revision_ok and revision or nil
 end
 
 --- Streams a response body straight to disk.
